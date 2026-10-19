@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>KN20A 録画コンソール</title>
+  <link rel="stylesheet" href="/style.css">
+  <script>window.KN20A_TOKEN = "__KN20A_TOKEN__";</script>
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow">FOMAKO KN20A</p>
+        <h1>録画コンソール</h1>
+        <p class="subtitle">Main Streamを無再圧縮で受信し、指定した開始・終了日時だけ録画します。</p>
+      </div>
+      <div id="service-pill" class="pill idle"><span></span>確認中</div>
+    </header>
+
+    <section class="metrics" aria-label="システム状態">
+      <article><span>受信状態</span><strong id="metric-state">—</strong><small id="metric-detail">—</small><button type="button" id="stop-recording" class="stop-recording" hidden>録画を停止</button></article>
+      <article><span>次の予約</span><strong id="metric-next">—</strong><small id="metric-next-title">—</small></article>
+      <article><span>保存先空き</span><strong id="metric-disk">—</strong><small id="metric-output">—</small></article>
+    </section>
+
+    <div id="notice" class="notice" hidden></div>
+
+    <section class="card schedule-card">
+      <div class="section-heading">
+        <div><p class="eyebrow">SCHEDULE</p><h2>録画予約</h2></div>
+        <button type="button" id="quick-test" class="secondary">30秒テスト録画</button>
+      </div>
+      <form id="schedule-form">
+        <label>名称<input id="title" name="title" maxlength="80" placeholder="例：夕景から夜景" required></label>
+        <label>画角プリセット<select id="schedule-preset"><option value="">指定なし</option></select></label>
+        <label>開始日時<input id="start" name="start" type="datetime-local" step="1" required></label>
+        <label>終了日時<input id="end" name="end" type="datetime-local" step="1" required></label>
+        <button type="submit" class="primary">予約を追加</button>
+      </form>
+      <p class="hint">時刻は日本時間（JST）。同時に受信できるMain Streamは1本なので、重複予約は登録できません。</p>
+    </section>
+
+    <section class="card">
+      <div class="section-heading"><div><p class="eyebrow">QUEUE</p><h2>予約一覧</h2></div><button type="button" id="refresh" class="ghost">更新</button></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>状態</th><th>名称</th><th>画角</th><th>開始</th><th>終了</th><th>出力</th><th></th></tr></thead>
+          <tbody id="schedule-rows"><tr><td colspan="7" class="empty">読み込み中…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card preset-card">
+      <div class="section-heading">
+        <div><p class="eyebrow">PTZ PRESETS</p><h2>画角プリセット</h2></div>
+      </div>
+      <p class="hint">先にカメラを目的の画角へ動かし、その位置を番号付きで保存します。プリセット0は電源復帰時の基準画角にも使われる特別枠です。</p>
+      <form id="preset-form">
+        <label>番号（0〜254）<input id="preset-number" type="number" min="0" max="254" value="1" required></label>
+        <label>名称<input id="preset-name" maxlength="60" placeholder="例：西側の空" required></label>
+        <button type="submit" id="save-preset" class="primary danger-aware">現在の画角を保存</button>
+      </form>
+      <div id="preset-list" class="preset-list"><p class="empty">プリセットはまだありません</p></div>
+    </section>
+
+    <section class="card exposure-card">
+      <div class="section-heading">
+        <div><p class="eyebrow">SECONDARY · EXPOSURE</p><h2>露出制御</h2></div>
+        <button type="button" id="load-exposure" class="secondary">カメラから取得</button>
+      </div>
+      <div class="exposure-note">
+        <strong>AAEは非推奨：</strong> この機種はAAEの自動SS上限が低く、屋外でオーバー露出になります。夕景は下の画像解析AEを使えます。
+      </div>
+      <form id="exposure-form">
+        <label>露出モード<select id="mode" disabled><option>先に取得してください</option></select></label>
+        <label>固定絞り<select id="iris" disabled><option>—</option></select></label>
+        <label>固定SS<select id="shutter" disabled><option>—</option></select></label>
+        <label>ゲイン上限（0〜15）<input id="gain-limit" type="number" min="0" max="15" disabled></label>
+        <button type="submit" id="apply-exposure" class="primary danger-aware" disabled>露出設定を反映</button>
+      </form>
+      <dl id="exposure-current" class="current-values"><div><dt>現在</dt><dd>未取得</dd></div></dl>
+      <p class="hint">設定変更は即時反映され、履歴を data/exposure_history.jsonl に保存します。録画予約とは独立しています。</p>
+      <div class="guard-panel">
+        <div class="guard-intro">
+          <h3>夕景AE（画像解析）</h3>
+          <p>設定した回折上限より絞り込まず、映像の明るさを自動調整します。</p>
+          <div class="guard-flow" aria-label="露出の調整順序">
+            <span><b>1</b> SSを調整</span><i>→</i><span><b>2</b> 絞りを開く</span><i>→</i><span><b>3</b> Gainを制限内で使用</span><i>→</i><span><b>4</b> 夜の暗さを許容</span>
+          </div>
+        </div>
+        <form id="guard-form">
+            <label>回折上限（最大F値）<select id="guard-iris-limit" disabled><option>F5.6</option></select></label>
+            <label>夜間方針<select id="guard-night-policy" disabled><option value="natural">自然・低ノイズ</option><option value="balanced">バランス</option><option value="visibility">視認性優先</option></select></label>
+            <label>露出補正（EV）<input id="guard-exposure-compensation" type="number" min="-2" max="1" step="0.1" value="0" disabled></label>
+            <label>最遅SS<select id="guard-slowest-shutter" disabled><option value="30">1/30</option><option value="60" selected>1/60</option></select></label>
+            <label>画質Gain上限（0〜15）<input id="guard-quality-gain" type="number" min="0" max="15" value="3" disabled></label>
+          <label class="check-label"><input id="guard-enabled" type="checkbox" disabled> 自動調整を有効化</label>
+          <div class="guard-actions">
+            <button type="submit" id="save-guard" class="secondary">設定を保存</button>
+            <button type="button" id="calibrate-guard" class="secondary">現在映像を基準にする</button>
+          </div>
+        </form>
+        <dl id="guard-current" class="guard-current"><div><dt>状態</dt><dd>停止中</dd></div></dl>
+      </div>
+    </section>
+
+    <footer><span id="clock">—</span><span>KN20A Recorder</span></footer>
+  </main>
+</body>
+</html>

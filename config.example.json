@@ -1,0 +1,16 @@
+{
+  "camera_ip": "192.0.2.10",
+  "visca_port": 5678,
+  "input_mode": "rtsp",
+  "input_url": "rtsp://192.0.2.10:554/live/av0",
+  "analysis_url": "rtsp://192.0.2.10:554/live/av1",
+  "analysis_ws_url": "ws://192.0.2.10:8088/live/av1",
+  "ffmpeg_path": "ffmpeg",
+  "output_dir": "recordings",
+  "segment_seconds": 600,
+  "postprocess_mp4": true,
+  "keep_mkv_after_remux": false,
+  "estimated_bitrate_mbps": 10,
+  "web_host": "127.0.0.1",
+  "web_port": 8765
+}

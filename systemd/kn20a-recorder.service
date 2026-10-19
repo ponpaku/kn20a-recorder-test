@@ -1,0 +1,18 @@
+[Unit]
+Description=KN20A scheduled recorder
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=%h/kn20a-recorder
+ExecStart="%h/kn20a-recorder/.venv/bin/python" "%h/kn20a-recorder/recorder.py" --no-browser
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=90
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

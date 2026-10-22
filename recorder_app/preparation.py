@@ -1,6 +1,6 @@
 """Non-blocking preset preparation with capture ownership and dispatch fencing."""
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import threading
 import time
@@ -49,6 +49,13 @@ class PresetCoordinator:
             self.closed = True
             self.jobs.clear()
 
+    def deadline(self, item):
+        # A new connection needs fresh preset confirmation: the camera may have
+        # rebooted. Its budget starts at the first preparation attempt, not at
+        # the original recording start or again on every retry.
+        origin = item.get("preset_reconnect_started_at") or item["start"]
+        return datetime.fromisoformat(origin) + timedelta(seconds=float(item.get("preset_deadline_seconds", 10)))
+
     def ready(self, item):
         if item.get("preset_number") is None:
             return True
@@ -57,6 +64,8 @@ class PresetCoordinator:
         start = datetime.fromisoformat(item["start"])
         end = datetime.fromisoformat(item["end"])
         with self.lock:
+            if item.get("status") == "reconnecting" and not item.get("preset_reconnect_started_at"):
+                item = self.store.update(item["id"], preset_reconnect_started_at=now.isoformat())
             job = self.jobs.get(item["id"])
             if job and job["revision"] != item.get("revision", 0):
                 self.jobs.pop(item["id"], None)
@@ -72,7 +81,7 @@ class PresetCoordinator:
                 self.store.update(item["id"], control_warning="プリセット制御は非対応です")
                 if policy == "continue":
                     return True
-            if policy == "require" and (now - start).total_seconds() >= float(item.get("preset_deadline_seconds", 10)):
+            if policy == "require" and now >= self.deadline(item):
                 self.store.update(item["id"], status="failed", last_error="プリセット準備が期限を超えました")
                 return False
             if now >= end:
@@ -106,7 +115,7 @@ class PresetCoordinator:
                 raise ControlConflict("無効・競合したプリセット要求を破棄しました")
             if current.get("preset_failure_policy") == "continue" and current.get("status") != "reconnecting" and now >= datetime.fromisoformat(current["start"]):
                 raise ControlConflict("録画開始後の遅延プリセットを破棄しました")
-            if current.get("preset_failure_policy") == "require" and (now - datetime.fromisoformat(current["start"])).total_seconds() >= float(current.get("preset_deadline_seconds", 10)):
+            if current.get("preset_failure_policy") == "require" and now >= self.deadline(current):
                 raise ControlConflict("プリセット要求の期限が切れました")
             job["sent"] = True
             self.in_flight = job

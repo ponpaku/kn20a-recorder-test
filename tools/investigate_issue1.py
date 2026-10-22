@@ -178,7 +178,7 @@ def media_cases(root):
     return report
 
 
-def network_case(root, binary, source, mode, disconnect=False):
+def network_case(root, binary, source, mode, disconnect=False, require=False):
     root.mkdir()
     listener = port()
     server = publisher = None
@@ -190,7 +190,11 @@ def network_case(root, binary, source, mode, disconnect=False):
               "preset_settle_seconds": 0, "estimated_bitrate_mbps": 1,
               "rtsp_timeout_microseconds": 1500000, "keep_mkv_after_remux": True}
     store = recorder.ScheduleStore(root / "schedules.json")
-    camera = NoControl()
+    class PresetControl:
+        calls = 0
+        def recall_preset(self, number, authorize):
+            with authorize(): self.calls += 1
+    camera = PresetControl() if require else NoControl()
     manager = recorder.RecorderManager(config, store, camera)
     started = False
 
@@ -211,8 +215,10 @@ def network_case(root, binary, source, mode, disconnect=False):
             publisher = publish()
             time.sleep(1)
         start = recorder.now_jst() + timedelta(seconds=1)
-        duration = 15 if disconnect else 8
-        item = store.create("fixture", start.isoformat(), (start + timedelta(seconds=duration)).isoformat())
+        duration = 30 if require else 15 if disconnect else 8
+        item = store.create("fixture", start.isoformat(), (start + timedelta(seconds=duration)).isoformat(),
+                            preset_number=2 if require else None,
+                            preset_failure_policy="require" if require else "continue")
         with mock.patch.object(recorder, "LOG_DIR", root):
             manager.start()
             started = True
@@ -223,10 +229,10 @@ def network_case(root, binary, source, mode, disconnect=False):
                 elapsed = time.monotonic() - begin
                 if mode == "rtmp-listen" and publisher is None and elapsed > 2:
                     publisher = publish()
-                if disconnect and not dropped and elapsed > 5:
+                if disconnect and not dropped and elapsed > (15 if require else 5):
                     stop(publisher)
                     dropped = True
-                if disconnect and dropped and not resumed and elapsed > 8:
+                if disconnect and dropped and not resumed and elapsed > (18 if require else 8):
                     publisher = publish()
                     resumed = True
                     last_publish = elapsed
@@ -274,6 +280,10 @@ def main():
                 break
             name = mode + ("_reconnect" if disconnect else "")
             report[name] = network_case(root / name, args.mediamtx, root / "h264_aac.mkv", mode, disconnect)
+        if not args.media_only:
+            for mode in ("rtsp", "rtmp-listen"):
+                name = mode + "_require_reconnect"
+                report[name] = network_case(root / name, args.mediamtx, root / "h264_aac.mkv", mode, True, require=True)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         if args.assert_network:
             for name in ("rtsp", "rtsp_reconnect", "rtmp-listen", "rtmp-listen_reconnect"):
@@ -282,6 +292,14 @@ def main():
                     continue  # Abrupt loss may damage a segment; safe retention is an accepted outcome.
                 if result["status"] != "completed" or result["camera_calls"] or not result.get("decode") or result["decode"]["code"] or result["decode"]["stderr"]:
                     raise SystemExit(f"Network acceptance failed: {name}")
+            for name in ("rtsp_require_reconnect", "rtmp-listen_require_reconnect"):
+                result = report[name]
+                if result["camera_calls"] < 2 or result["attempts"] < 2:
+                    raise SystemExit(f"Require preset/recording was not resumed: {name}")
+                if result["status"] == "postprocess_failed" and result["mkv_count"] > 0:
+                    continue  # Same source-retention contract as other disconnect tests.
+                if result["status"] != "completed" or not result.get("decode") or result["decode"]["code"] or result["decode"]["stderr"]:
+                    raise SystemExit(f"Require reconnection acceptance failed: {name}")
 
 
 if __name__ == "__main__":

@@ -54,7 +54,7 @@ Genericには `config.example.json`、KN20A制御には `config.kn20a.example.js
 - `recording.segment_seconds`: 分割の目安秒数、既定600。GOP境界で分割するため厳密な秒数ではありません。
 - `recording.retain_sources`: 新規既定true。falseでも、原本との対応証跡・packet検査・全体デコード検証が成功するまで原本を削除しません。
 - `recording.preset_failure_policy`: 新規既定 `continue`、画角必須なら `require`、旧動作は `legacy`。
-- `recording.preset_deadline_seconds`: require時の開始後待機上限、既定10秒（最大60秒）。
+- `recording.preset_deadline_seconds`: require時の開始後待機上限、既定10秒（最大60秒）。通信断後はプリセットを再適用し、最初の再準備から別の同じ長さの期限を設けます。再準備できない場合も収録済み素材は後処理へ進めます。
 - `estimated_bitrate_mbps`: 同じ入力の実績がない場合の容量見積もり。
 - `stall_timeout_seconds` / `connection_timeout_seconds`: FFmpeg進捗停止監視、既定15秒 / 45秒。
 - `validation_timeout_seconds`: メディア検査・結合の上限、既定21600秒。長時間の全体検証はCPUと時間を使用します。

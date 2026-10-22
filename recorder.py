@@ -542,7 +542,8 @@ class RecorderManager:
                         self.store.update(item["id"], status="recovery_required", last_error="録画ファイルの復旧照合が必要です")
                     continue
                 if previous != "pending":
-                    self.store.update(item["id"], status="pending", previous_capture_state=previous,
+                    self.store.update(item["id"], status="reconnecting", previous_capture_state=previous,
+                                      preset_reconnect_started_at=item.get("preset_reconnect_started_at") if previous == "reconnecting" else None,
                                       gaps=item.get("gaps", []) + [{"reason": "process_restart", "at": now_jst().isoformat()}])
             if item.get("status") in {"finalizing", "postprocess_failed"}:
                 self._queue_finalization(item["id"])
@@ -682,11 +683,27 @@ class RecorderManager:
             self._stop_process(graceful=True)
 
         if self.process is None and time.monotonic() >= self.next_retry_at:
+            # Finishing a process may have changed recording -> reconnecting
+            # during this tick. Do not prepare from the earlier snapshot.
+            active = self.store.get(active["id"])
+            if not active or active.get("status") not in {"pending", "starting", "recording", "reconnecting"}:
+                return
             if self._prepare_preset(active):
                 self.preparation.set_owner(active["id"])
                 self._start_process(active)
-                if self.store.get(active["id"]).get("status") == "failed":
-                    self.preparation.set_owner(None)
+            current_item = self.store.get(active["id"])
+            if current_item and current_item.get("status") == "failed":
+                self.preparation.set_owner(None)
+                folder = Path(current_item["output_dir"]) if current_item.get("output_dir") else None
+                if folder and (list(folder.glob("part_*.mkv")) or list(folder.glob("part_*.mp4"))):
+                    # Failure to resume must not strand already captured media.
+                    self.store.update(active["id"], capture_stop_reason=current_item.get("last_error", ""),
+                                      control_warning="録画再開を中止: " + current_item.get("last_error", ""))
+                    if bool(self.config.get("postprocess_mp4", True)):
+                        self._queue_finalization(active["id"])
+                    else:
+                        self.store.update(active["id"], status="completed", outcome="partial",
+                                          completed_at=now_jst().isoformat())
         elif self.process is not None:
             self._update_recording_state(active["id"])
 
@@ -824,8 +841,9 @@ class RecorderManager:
             return
         for line in iter(process.stderr.readline, b""):
             text = line.decode("utf-8", errors="replace")
-            text = re.sub(r"((?:rtsps?|rtmps?|https?|wss?)://)[^\s/@]+@", r"\1***@", text)
-            text = re.sub(r"([?&](?:password|token|key|passphrase)=)[^\s&]+", r"\1***", text, flags=re.I)
+            # Signed URLs can carry secrets under arbitrary query/path names.
+            # Hide the whole URL rather than attempting a credential allowlist.
+            text = re.sub(r"\b(?:rtsps?|rtmps?|https?|wss?)://\S+", "[STREAM_URL_REDACTED]", text, flags=re.I)
             with self.lock:
                 if self.log_handle is not None and self.process is process:
                     self.log_handle.write(text.encode("utf-8"))
@@ -943,6 +961,7 @@ class RecorderManager:
                 else:
                     self.last_error = f"ffmpegが終了しました (code={exit_code})。再接続します"
                     self.store.update(schedule_id, status="reconnecting", last_error=self.last_error,
+                                      preset_reconnect_started_at=None,
                                       gaps=item.get("gaps", []) + [{"reason": "stream_exit", "at": now_jst().isoformat(), "code": exit_code}])
                     base_retry = int(self.config["retry_seconds"])
                     retry_delay = min(60, base_retry * (2 ** min(max(self.attempt - 1, 0), 4)))

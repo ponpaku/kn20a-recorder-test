@@ -278,6 +278,80 @@ coordinator.manual(lambda: os._exit(73))
         with self.assertRaises(ControlConflict):
             with coordinator.authorize(item,job): self.fail("must not dispatch")
 
+    def test_reconnection_budget_is_persisted_and_not_reset_by_restart(self):
+        item = self.reservation(preset_number=2, preset_failure_policy="require", preset_deadline_seconds=5)
+        self.store.update(item["id"], start=(self.now - timedelta(minutes=1)).isoformat(), status="reconnecting")
+        coordinator = PresetCoordinator(None, self.store, {}, lambda: self.now)
+        self.assertFalse(coordinator.ready(self.store.get(item["id"])))
+        current = self.store.get(item["id"])
+        self.assertEqual(current["status"], "reconnecting")
+        self.assertEqual(current["preset_reconnect_started_at"], self.now.isoformat())
+        later = self.now + timedelta(seconds=6)
+        loaded = recorder.ScheduleStore(self.store.path)
+        restored = PresetCoordinator(None, loaded, {}, lambda: later)
+        self.assertFalse(restored.ready(loaded.get(item["id"])))
+        self.assertEqual(loaded.get(item["id"])["status"], "failed")
+        job = {"revision": 0, "sent": False}
+        restored.jobs[item["id"]] = job
+        loaded.update(item["id"], status="reconnecting")
+        with self.assertRaises(ControlConflict):
+            with restored.authorize(loaded.get(item["id"]), job): self.fail("late reconnect send")
+
+    def test_restart_of_active_capture_requires_fresh_preset_confirmation(self):
+        item = self.reservation(preset_number=2, preset_failure_policy="require")
+        self.store.update(item["id"], start=(self.now-timedelta(seconds=30)).isoformat(), status="recording")
+        manager = recorder.RecorderManager({**recorder.DEFAULT_CONFIG, "output_dir_resolved": str(self.root)}, self.store)
+        with mock.patch.object(recorder, "LOG_DIR", self.root), mock.patch.object(manager.thread, "start"), mock.patch.object(manager.finalizer_thread, "start"):
+            manager.start()
+        restored = self.store.get(item["id"])
+        self.assertEqual(restored["status"], "reconnecting")
+        self.assertFalse(manager._prepare_preset(restored))
+        self.assertEqual(self.store.get(item["id"])["status"], "reconnecting")
+
+    def test_stream_urls_are_fully_redacted_before_log_write(self):
+        urls = [
+            "rtsp://camera.example/live?access_token=secret123&signature=xyz",
+            "rtsps://user:basic-secret@camera.example/live",
+            "rtmp://camera.example/live/path-secret?arbitrary=other-secret",
+            "RTMPS://camera.example/live?token=rtmps-secret",
+            "https://storage.example/path-secret?X-Amz-Credential=cred-secret&X-Amz-Signature=signed-secret",
+            "http://user:http-secret@camera.example/path",
+            "wss://camera.example/live?auth=ws-secret",
+        ]
+        manager = recorder.RecorderManager({**recorder.DEFAULT_CONFIG, "output_dir_resolved": str(self.root)}, self.store)
+        manager.log_handle = io.BytesIO()
+        manager.process = mock.Mock(stderr=io.BytesIO(("open " + " ".join(urls) + " failed\n").encode()))
+        manager._read_recording_log(manager.process)
+        saved = manager.log_handle.getvalue().decode()
+        self.assertEqual(saved.count("[STREAM_URL_REDACTED]"), len(urls))
+        self.assertTrue(saved.startswith("open "))
+        self.assertTrue(saved.endswith(" failed\n"))
+        for secret in ("secret", "secret123", "xyz", "camera.example", "storage.example"):
+            self.assertNotIn(secret, saved)
+
+    def test_require_resume_failure_respects_disabled_postprocessing(self):
+        item = self.reservation(preset_number=2, preset_failure_policy="require", preset_deadline_seconds=5)
+        folder = self.root / "recordings" / "run"
+        folder.mkdir(parents=True)
+        source = folder / "part_01.mkv"
+        source.write_bytes(b"previously captured media")
+        epoch = (self.now - timedelta(seconds=10)).isoformat()
+        self.store.update(item["id"], status="reconnecting", start=(self.now-timedelta(minutes=1)).isoformat(),
+                          output_dir=str(folder), preset_reconnect_started_at=epoch)
+        manager = recorder.RecorderManager({**recorder.DEFAULT_CONFIG, "postprocess_mp4": False,
+            "output_dir_resolved": str(folder.parent)}, self.store)
+        manager.preparation.set_owner(item["id"])
+        with mock.patch.object(recorder, "LOG_DIR", self.root), mock.patch.object(manager.thread, "start"), mock.patch.object(manager.finalizer_thread, "start"):
+            manager.start()
+        self.assertEqual(self.store.get(item["id"])["preset_reconnect_started_at"], epoch)
+        with mock.patch.object(manager, "_queue_finalization") as queue:
+            manager._tick()
+        queue.assert_not_called()
+        self.assertEqual(self.store.get(item["id"])["status"], "completed")
+        self.assertEqual(self.store.get(item["id"])["outcome"], "partial")
+        self.assertTrue(source.exists())
+        self.assertIsNone(manager.preparation.owner)
+
     def test_recovery_after_end_queues_existing_mkv_before_missed(self):
         item = self.reservation()
         folder = self.root / "recordings" / "run"
@@ -407,6 +481,79 @@ class RealArtifactSafety(unittest.TestCase):
         if audio: args += ["-c:a",audio]
         subprocess.run(args+[str(path)],capture_output=True,check=True,timeout=20)
         return path
+
+    def require_reconnect_scenario(self, fail_recall=False, no_camera=False):
+        clock = [recorder.now_jst()]
+        start = clock[0] + timedelta(seconds=2)
+        end = start + timedelta(minutes=2)
+        store = recorder.ScheduleStore(self.root / "schedules.json")
+        item = store.create("require reconnect", start.isoformat(), end.isoformat(),
+                            preset_number=2, preset_failure_policy="require", preset_deadline_seconds=10)
+        calls = []
+        class Camera:
+            def recall_preset(self, number, authorize):
+                with authorize(): calls.append(number)
+                if fail_recall and len(calls) == 2: raise TimeoutError("no reconnect completion")
+        with mock.patch.object(recorder, "now_jst", side_effect=lambda: clock[0]):
+            manager = recorder.RecorderManager({**recorder.DEFAULT_CONFIG, **self.config,
+                "preset_settle_seconds": 0, "retry_seconds": 0}, store, Camera())
+            captures = []
+            def capture(current):
+                captures.append(current["id"])
+                self.segment(f"part_{len(captures):02d}.mkv")
+                manager.process = mock.Mock()
+                manager.process.poll.return_value = None
+                manager.active_id = current["id"]
+                manager.run_dir = self.run
+                manager.last_progress_at = time.monotonic()
+                manager.progress_started = True
+                store.update(current["id"], status="recording", output_dir=str(self.run))
+            with mock.patch.object(manager, "_start_process", side_effect=capture):
+                manager._prepare_preset(item)
+                self.assertTrue(manager.preparation.jobs[item["id"]]["done"].wait(3))
+                clock[0] = start
+                manager._tick()
+                self.assertEqual(store.get(item["id"])["status"], "recording")
+                clock[0] = start + timedelta(seconds=20)
+                manager.process.poll.return_value = 1
+                if no_camera: manager.preparation.camera = None
+                manager._tick()  # Includes finish, fresh snapshot, and preparation.
+                self.assertEqual(store.get(item["id"])["status"], "reconnecting")
+                if not no_camera:
+                    self.assertTrue(manager.preparation.jobs[item["id"]]["done"].wait(3))
+                if fail_recall or no_camera:
+                    clock[0] += timedelta(seconds=11)
+                    manager._tick()
+                    self.assertEqual(len(captures), 1)
+                    self.assertIn("期限", store.get(item["id"])["capture_stop_reason"])
+                else:
+                    manager._tick()
+                    self.assertEqual(len(captures), 2)
+                    self.assertEqual(calls, [2, 2])
+                    clock[0] = end
+                    manager.process.poll.return_value = 0
+                    manager._tick()
+                self.assertEqual(store.get(item["id"])["status"], "finalizing")
+                self.assertIsNone(manager.preparation.owner)
+                self.assertEqual(manager.finalize_queue.get_nowait(), item["id"])
+                manager._remux_schedule(item["id"])
+        result = store.get(item["id"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["outcome"], "partial")
+        if fail_recall or no_camera:
+            self.assertIn("録画再開を中止", result["control_warning"])
+        self.assertEqual(len(result["mp4_files"]), 1)
+        self.assertTrue(Path(result["mp4_files"][0]).is_file())
+        self.assertEqual(list(self.run.glob("part_*.mkv")), [])
+
+    def test_require_after_twenty_seconds_disconnect_reconnect_and_finalize(self):
+        self.require_reconnect_scenario()
+
+    def test_require_reconnect_timeout_finalizes_existing_media(self):
+        self.require_reconnect_scenario(fail_recall=True)
+
+    def test_require_reconnect_without_control_finalizes_existing_media(self):
+        self.require_reconnect_scenario(no_camera=True)
 
     def test_untrusted_existing_output_does_not_authorize_cleanup(self):
         source = self.segment()

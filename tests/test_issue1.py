@@ -3,6 +3,7 @@ from contextlib import ExitStack
 from contextlib import nullcontext
 from datetime import timedelta
 import json
+import io
 from pathlib import Path
 import shutil
 import socketserver
@@ -46,8 +47,8 @@ class Contracts(unittest.TestCase):
         self.assertNotIn("controls", old)
 
     def test_frame_metadata_field_order_is_not_assumed(self):
-        data = [b"width=64|height=96|pix_fmt=yuv420p|side_data_type=unregistered\n",
-                b"pix_fmt=yuv420p|height=96|width=64\n"]
+        data = io.BytesIO(json.dumps({"frames":[{"width":64,"height":96,"pix_fmt":"yuv420p","side_data_list":[{"side_data_type":"unregistered"}]},
+                     {"pix_fmt":"yuv420p","height":96,"width":64}]}).encode())
         self.assertEqual(frame_shapes(data),{("64","96","yuv420p")})
 
     def test_generic_constructs_no_kn20a_clients(self):
@@ -162,6 +163,7 @@ class Contracts(unittest.TestCase):
         coordinator = PresetCoordinator(Camera(),self.store,{"preset_settle_seconds":0},lambda:self.now)
         coordinator.ready(item)
         self.assertTrue(done.wait(2))
+        self.assertTrue(coordinator.jobs[item["id"]]["done"].wait(3))
         for _ in range(100):
             if coordinator.uncertain: break
             time.sleep(0.01)

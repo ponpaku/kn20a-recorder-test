@@ -76,7 +76,7 @@ class PresetCoordinator:
                 can_send = False
             if can_send and (job is None or job["state"] == "failure"):
                 job = {"state": "queued", "revision": item.get("revision", 0), "sent": False,
-                       "preset": item["preset_number"], "retry_at": 0}
+                       "preset": item["preset_number"], "retry_at": 0, "done": threading.Event()}
                 self.jobs[item["id"]] = job
                 threading.Thread(target=self._run, args=(item, job), daemon=True).start()
             if policy == "continue" and now >= start:
@@ -125,6 +125,7 @@ class PresetCoordinator:
             with self.lock:
                 if self.in_flight is job:
                     self.in_flight = None
+                job["done"].set()
 
     def manual(self, operation):
         with self.lock:

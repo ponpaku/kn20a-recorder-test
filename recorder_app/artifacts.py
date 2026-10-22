@@ -18,13 +18,34 @@ def digest(path):
     return value.hexdigest()
 
 
-def frame_shapes(lines):
+def frame_shapes(handle):
+    """Read frame JSON incrementally: bounded memory even for long recordings."""
+    decoder = json.JSONDecoder()
+    buffer = ""
+    started = False
     shapes = set()
-    for line in lines:
-        values = dict(part.split("=", 1) for part in line.decode(errors="replace").strip().split("|") if "=" in part)
-        if "width" in values and "height" in values and "pix_fmt" in values:
-            shapes.add((values["width"], values["height"], values["pix_fmt"]))
-    return shapes
+    while True:
+        chunk = handle.read(65536)
+        if not chunk:
+            raise RuntimeError("Incomplete frame metadata")
+        buffer += chunk.decode("utf-8", errors="replace")
+        if not started:
+            index = buffer.find("[")
+            if index < 0:
+                continue
+            buffer = buffer[index + 1:]
+            started = True
+        while True:
+            buffer = buffer.lstrip(" \r\n\t,")
+            if buffer.startswith("]"):
+                return shapes
+            try:
+                frame, end = decoder.raw_decode(buffer)
+            except json.JSONDecodeError:
+                break
+            if all(key in frame for key in ("width", "height", "pix_fmt")):
+                shapes.add((str(frame["width"]), str(frame["height"]), frame["pix_fmt"]))
+            buffer = buffer[end:]
 
 
 def persist(path, value):
@@ -65,7 +86,7 @@ class Finalizer:
         # Header metadata alone misses a resolution/pixel-format switch inside a segment.
         with tempfile.TemporaryFile() as frames:
             scan = subprocess.run([self.ffprobe, "-v", "error", "-select_streams", "v:0",
-                "-show_frames", "-show_entries", "frame=width,height,pix_fmt", "-of", "compact=p=0:nk=0", str(path)],
+                "-show_frames", "-show_entries", "frame=width,height,pix_fmt", "-of", "json", str(path)],
                 stdout=frames, stderr=subprocess.PIPE,
                 timeout=float(self.config.get("validation_timeout_seconds", 21600)))
             if scan.returncode or scan.stderr.strip():

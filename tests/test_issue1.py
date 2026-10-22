@@ -16,7 +16,7 @@ import urllib.error
 from unittest import mock
 
 import recorder
-from recorder_app.artifacts import Finalizer, digest, persist
+from recorder_app.artifacts import Finalizer, digest, persist, frame_shapes
 from recorder_app.configuration import normalize, to_v2
 from recorder_app.controls import make_controls
 from recorder_app.inputs import input_adapter
@@ -44,6 +44,11 @@ class Contracts(unittest.TestCase):
         self.assertEqual(migrated["preset_failure_policy"], "legacy")
         self.assertEqual(migrated["input_url"], old["input_url"])
         self.assertNotIn("controls", old)
+
+    def test_frame_metadata_field_order_is_not_assumed(self):
+        data = [b"width=64|height=96|pix_fmt=yuv420p|side_data_type=unregistered\n",
+                b"pix_fmt=yuv420p|height=96|width=64\n"]
+        self.assertEqual(frame_shapes(data),{("64","96","yuv420p")})
 
     def test_generic_constructs_no_kn20a_clients(self):
         config = normalize({**recorder.DEFAULT_CONFIG, "schema_version": 2,

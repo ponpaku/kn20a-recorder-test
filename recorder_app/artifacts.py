@@ -18,6 +18,15 @@ def digest(path):
     return value.hexdigest()
 
 
+def frame_shapes(lines):
+    shapes = set()
+    for line in lines:
+        values = dict(part.split("=", 1) for part in line.decode(errors="replace").strip().split("|") if "=" in part)
+        if "width" in values and "height" in values and "pix_fmt" in values:
+            shapes.add((values["width"], values["height"], values["pix_fmt"]))
+    return shapes
+
+
 def persist(path, value):
     temporary = path.with_suffix(".json.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
@@ -56,17 +65,13 @@ class Finalizer:
         # Header metadata alone misses a resolution/pixel-format switch inside a segment.
         with tempfile.TemporaryFile() as frames:
             scan = subprocess.run([self.ffprobe, "-v", "error", "-select_streams", "v:0",
-                "-show_frames", "-show_entries", "frame=width,height,pix_fmt", "-of", "csv=p=0", str(path)],
+                "-show_frames", "-show_entries", "frame=width,height,pix_fmt", "-of", "compact=p=0:nk=0", str(path)],
                 stdout=frames, stderr=subprocess.PIPE,
                 timeout=float(self.config.get("validation_timeout_seconds", 21600)))
             if scan.returncode or scan.stderr.strip():
                 raise RuntimeError(f"Source frame scan failed: {path.name}")
             frames.seek(0)
-            shapes = set()
-            for line in frames:
-                parts = line.decode(errors="replace").strip().split(",")
-                if len(parts) >= 3 and parts[0].isdigit() and parts[1].isdigit():
-                    shapes.add(tuple(parts[:3]))
+            shapes = frame_shapes(frames)
             expected_shape = (str(selected[0].get("width")), str(selected[0].get("height")), selected[0].get("pix_fmt"))
             if shapes != {expected_shape}:
                 raise RuntimeError(f"In-segment format change or missing frames: {path.name}")

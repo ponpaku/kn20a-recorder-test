@@ -74,7 +74,7 @@ class Finalizer:
             shapes = frame_shapes(frames)
             expected_shape = (str(selected[0].get("width")), str(selected[0].get("height")), selected[0].get("pix_fmt"))
             if shapes != {expected_shape}:
-                raise RuntimeError(f"In-segment format change or missing frames: {path.name}")
+                raise RuntimeError(f"In-segment format change or missing frames: {path.name}; expected={expected_shape!r}; decoded={shapes!r}")
         fields = ("codec_type", "codec_name", "profile", "level", "width", "height", "pix_fmt",
                   "sample_aspect_ratio", "time_base", "sample_rate", "channels", "channel_layout", "extradata_hash")
         return {"fingerprint": [{k: s.get(k) for k in fields} for s in selected],

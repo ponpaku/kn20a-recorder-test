@@ -217,6 +217,7 @@ def network_case(root, binary, source, mode, disconnect=False):
             started = True
             begin = time.monotonic()
             dropped = resumed = False
+            last_publish = 0
             while time.monotonic() - begin < duration + 20:
                 elapsed = time.monotonic() - begin
                 if mode == "rtmp-listen" and publisher is None and elapsed > 2:
@@ -227,6 +228,10 @@ def network_case(root, binary, source, mode, disconnect=False):
                 if disconnect and dropped and not resumed and elapsed > 8:
                     publisher = publish()
                     resumed = True
+                    last_publish = elapsed
+                if mode == "rtmp-listen" and resumed and publisher.poll() is not None and elapsed - last_publish > 1 and elapsed < duration:
+                    publisher = publish()
+                    last_publish = elapsed
                 final = store.get(item["id"])
                 if final["status"] in {"completed", "failed", "postprocess_failed", "missed"}:
                     break

@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import socketserver
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -172,6 +173,93 @@ class Contracts(unittest.TestCase):
         self.assertTrue(restored.uncertain)
         restored.acknowledge()
         self.assertFalse(self.store.get(item["id"])["control_uncertain"])
+
+    def restore_coordinator(self, camera=None):
+        return PresetCoordinator(camera, recorder.ScheduleStore(self.store.path),
+                                 {"preset_settle_seconds": 0}, lambda: self.now)
+
+    def test_manual_timeout_survives_restart_and_blocks_automatic_send(self):
+        item = self.reservation(preset_number=2)
+        coordinator = self.restore_coordinator()
+        with self.assertRaises(TimeoutError):
+            coordinator.manual(mock.Mock(side_effect=TimeoutError("sent, no completion")))
+        camera = mock.Mock()
+        restored = self.restore_coordinator(camera)
+        self.assertTrue(restored.uncertain)
+        self.assertFalse(restored.ready(item))
+        self.assertEqual(restored.jobs, {})
+        camera.recall_preset.assert_not_called()
+        with self.assertRaises(ControlConflict): restored.manual(lambda: None)
+
+    def test_manual_process_exit_after_dispatch_requires_acknowledgement(self):
+        # Real process termination skips exception handlers and finally blocks.
+        script = """
+import os, sys
+from pathlib import Path
+import recorder
+from recorder_app.preparation import PresetCoordinator
+store = recorder.ScheduleStore(Path(sys.argv[1]))
+coordinator = PresetCoordinator(None, store, {}, recorder.now_jst)
+coordinator.manual(lambda: os._exit(73))
+"""
+        result = subprocess.run([sys.executable, "-c", script, str(self.store.path)],
+                                cwd=Path(recorder.__file__).parent, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 73, result.stderr.decode(errors="replace"))
+        state = json.loads(self.store.path.with_name("schedules.control.json").read_text())
+        self.assertTrue(state["in_flight"])
+        restored = self.restore_coordinator()
+        self.assertTrue(restored.uncertain)
+        with self.assertRaises(ControlConflict): restored.manual(lambda: None)
+        restored.acknowledge()
+        self.assertFalse(self.restore_coordinator().uncertain)
+        self.assertEqual(restored.manual(lambda: "confirmed"), "confirmed")
+
+    def test_manual_success_does_not_leave_restart_hold(self):
+        coordinator = self.restore_coordinator()
+        self.assertEqual(coordinator.manual(lambda: "completed"), "completed")
+        self.assertFalse(self.restore_coordinator().uncertain)
+
+    def test_manual_journal_failure_prevents_dispatch(self):
+        coordinator = self.restore_coordinator()
+        operation = mock.Mock()
+        with mock.patch("recorder_app.preparation.persist", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError): coordinator.manual(operation)
+        operation.assert_not_called()
+
+    def test_manual_completion_persist_failure_keeps_restart_hold(self):
+        coordinator = self.restore_coordinator()
+        durable_persist = persist
+        def fail_completion(path, state):
+            if not state["in_flight"]: raise OSError("completion save failed")
+            durable_persist(path, state)
+        with mock.patch("recorder_app.preparation.persist", side_effect=fail_completion):
+            with self.assertRaises(OSError): coordinator.manual(lambda: None)
+        self.assertTrue(coordinator.uncertain)
+        self.assertTrue(self.restore_coordinator().uncertain)
+
+    def test_manual_failed_acknowledgement_does_not_release_hold(self):
+        coordinator = self.restore_coordinator()
+        with self.assertRaises(TimeoutError):
+            coordinator.manual(mock.Mock(side_effect=TimeoutError()))
+        with mock.patch("recorder_app.preparation.persist", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError): coordinator.acknowledge()
+        self.assertTrue(coordinator.uncertain)
+        self.assertTrue(self.restore_coordinator().uncertain)
+
+    def test_manual_acknowledgement_reenables_automatic_preparation(self):
+        item = self.reservation(preset_number=2)
+        coordinator = self.restore_coordinator()
+        with self.assertRaises(TimeoutError):
+            coordinator.manual(mock.Mock(side_effect=TimeoutError()))
+        restored = self.restore_coordinator()
+        restored.acknowledge()
+        class Camera:
+            def recall_preset(self, number, authorize):
+                with authorize(): pass
+        resumed = self.restore_coordinator(Camera())
+        resumed.ready(item)
+        self.assertTrue(resumed.jobs[item["id"]]["done"].wait(3))
+        self.assertEqual(resumed.jobs[item["id"]]["state"], "success")
 
     def test_revision_change_before_send_is_fenced(self):
         item = self.reservation(preset_number=2)
@@ -411,6 +499,68 @@ class RealArtifactSafety(unittest.TestCase):
         outputs,_ = self.finalizer.finalize(self.run)
         self.assertEqual(len(outputs),2)
         self.assertEqual([self.finalizer.inspect(Path(p))["fingerprint"][0]["width"] for p in outputs],[64,96])
+
+    def partial_groups(self):
+        self.segment("part_01.mkv", size="64x64")
+        self.segment("part_02.mkv", size="96x96")
+        def fail_second(output, sources):
+            if output.name == "recording_002.mp4.partial":
+                raise RuntimeError("second group failed")
+            return Finalizer.validate(self.finalizer, output, sources)
+        return fail_second
+
+    def test_partial_success_is_reused_across_repeated_restarts(self):
+        fail_second = self.partial_groups()
+        completed = self.run / "recording_001.mp4"
+        for attempt in range(3):
+            self.finalizer = Finalizer(self.config)
+            with mock.patch.object(self.finalizer, "validate", side_effect=fail_second):
+                with self.assertRaisesRegex(RuntimeError, "second group failed"):
+                    self.finalizer.finalize(self.run)
+            current = (digest(completed), completed.stat().st_mtime_ns)
+            if attempt == 0: original = current
+            self.assertEqual(current, original)
+            self.assertEqual(len(list(self.run.glob("*.mp4"))), 1)
+            self.assertEqual(list(self.run.glob("unverified_*.mp4")), [])
+            manifest = json.loads((self.run / "manifest.json").read_text())
+            self.assertEqual(manifest["phase"], "preparing")
+            self.assertEqual(len(manifest["groups"]), 1)
+            self.assertEqual(len(list(self.run.glob("part_*.mkv"))), 2)
+        outputs, state = Finalizer(self.config).finalize(self.run)
+        self.assertEqual(state, "verified")
+        self.assertEqual(len(outputs), 2)
+        self.assertEqual((digest(completed), completed.stat().st_mtime_ns), original)
+        self.assertEqual(list(self.run.glob("part_*.mkv")), [])
+
+    def test_changed_partial_source_prevents_reuse_and_cleanup(self):
+        fail_second = self.partial_groups()
+        with mock.patch.object(self.finalizer, "validate", side_effect=fail_second):
+            with self.assertRaises(RuntimeError): self.finalizer.finalize(self.run)
+        receipt = (self.run / "manifest.json").read_bytes()
+        completed_hash = digest(self.run / "recording_001.mp4")
+        (self.run / "part_01.mkv").write_bytes(b"modified original")
+        resumed = Finalizer(self.config)
+        with mock.patch.object(resumed, "validate") as validate:
+            with self.assertRaisesRegex(RuntimeError, "Sources changed since preparation"):
+                resumed.finalize(self.run)
+        validate.assert_not_called()
+        self.assertEqual((self.run / "manifest.json").read_bytes(), receipt)
+        self.assertEqual(digest(self.run / "recording_001.mp4"), completed_hash)
+        self.assertEqual(len(list(self.run.glob("part_*.mkv"))), 2)
+
+    def test_changed_partial_output_is_regenerated_once_not_blindly_reused(self):
+        fail_second = self.partial_groups()
+        with mock.patch.object(self.finalizer, "validate", side_effect=fail_second):
+            with self.assertRaises(RuntimeError): self.finalizer.finalize(self.run)
+        completed = self.run / "recording_001.mp4"
+        completed.write_bytes(b"corrupted output")
+        for _ in range(2):
+            resumed = Finalizer(self.config)
+            with mock.patch.object(resumed, "validate", side_effect=fail_second):
+                with self.assertRaises(RuntimeError): resumed.finalize(self.run)
+            self.assertNotEqual(completed.read_bytes(), b"corrupted output")
+            self.assertEqual(len(list(self.run.glob("unverified_*.mp4"))), 1)
+            self.assertEqual(len(list(self.run.glob("part_*.mkv"))), 2)
 
     def test_g711_is_kept_without_silent_audio_conversion(self):
         source = self.segment(audio="pcm_alaw")

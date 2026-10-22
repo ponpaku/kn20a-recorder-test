@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 config.json
 schedules.json
+schedules.control.json
 presets.json
 data/
 logs/

@@ -1,8 +1,10 @@
 """Non-blocking preset preparation with capture ownership and dispatch fencing."""
 from contextlib import contextmanager
 from datetime import datetime
+import json
 import threading
 import time
+from .artifacts import persist
 
 
 class ControlConflict(RuntimeError): pass
@@ -14,7 +16,13 @@ class PresetCoordinator:
         self.lock = threading.RLock()
         self.owner = None
         self.jobs = {}
-        self.uncertain = any(item.get("control_in_flight") or item.get("control_uncertain") for item in store.list())
+        # Manual commands have no reservation to carry their crash-recovery state.
+        self.manual_state_path = store.path.with_name(store.path.stem + ".control.json")
+        manual_state = json.loads(self.manual_state_path.read_text(encoding="utf-8")) if self.manual_state_path.exists() else {}
+        if not isinstance(manual_state, dict):
+            raise ValueError("Invalid manual control state")
+        self.uncertain = bool(manual_state.get("in_flight") or manual_state.get("uncertain") or
+                              any(item.get("control_in_flight") or item.get("control_uncertain") for item in store.list()))
         self.closed = False
         self.in_flight = None
 
@@ -30,10 +38,11 @@ class PresetCoordinator:
         with self.lock:
             if self.in_flight is not None:
                 raise ControlConflict("制御要求はまだ実行中です")
-            self.uncertain = False
             for item in self.store.list():
                 if item.get("control_uncertain") or item.get("control_in_flight"):
                     self.store.update(item["id"], control_uncertain=False, control_in_flight=False)
+            persist(self.manual_state_path, {"in_flight": False, "uncertain": False})
+            self.uncertain = False
 
     def shutdown(self):
         with self.lock:
@@ -129,15 +138,22 @@ class PresetCoordinator:
 
     def manual(self, operation):
         with self.lock:
-            if self.owner or self.in_flight or self.uncertain:
+            if self.closed or self.owner or self.in_flight or self.uncertain:
                 raise ControlConflict("録画・準備中または画角未確定のため操作できません")
+            # Commit before calling code that can send a camera command. A crash
+            # at any later point must require explicit operator acknowledgement.
+            persist(self.manual_state_path, {"in_flight": True, "uncertain": False})
             marker = object()
             self.in_flight = marker
         try:
-            return operation()
-        except Exception:
+            result = operation()
+            with self.lock:
+                persist(self.manual_state_path, {"in_flight": False, "uncertain": False})
+            return result
+        except BaseException:
             with self.lock:
                 self.uncertain = True
+                persist(self.manual_state_path, {"in_flight": False, "uncertain": True})
             raise
         finally:
             with self.lock:

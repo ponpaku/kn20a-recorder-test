@@ -158,6 +158,7 @@ def media_cases(root):
     shutil.copy(root / "h264_aac.mkv", retained_source)
     shutil.copy(truncated, retention_run / "recording.mp4")
     store = mock.Mock()
+    store.path = root / "retention-schedules.json"
     store.list.return_value = []
     store.get.return_value = {"id": "test", "output_dir": str(retention_run)}
     retention_manager = recorder.RecorderManager({"ffmpeg_path": shutil.which("ffmpeg"),

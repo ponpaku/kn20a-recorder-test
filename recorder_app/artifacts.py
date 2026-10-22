@@ -167,6 +167,10 @@ class Finalizer:
             raise RuntimeError("No original MKV/MP4 segments found")
         if any(run_dir.glob("part_*.mkv")) and any(run_dir.glob("part_*.mp4")):
             raise RuntimeError("Mixed legacy and MKV sources require manual reconciliation")
+        if previous and previous.get("phase") == "preparing":
+            recorded = {s["name"]: s["sha256"] for s in previous["sources"]}
+            if len(recorded) != len(previous["sources"]) or {p.name: digest(p) for p in files} != recorded:
+                raise RuntimeError("Sources changed since preparation; no reuse or cleanup performed")
         sources = [{"name": path.name, "sha256": digest(path), "size": path.stat().st_size,
                     "media": self.inspect(path)} for path in files]
         groups = []
@@ -175,6 +179,26 @@ class Finalizer:
                 groups.append([])
             groups[-1].append(source)
         manifest = {"version": 1, "phase": "preparing", "input_id": self.config.get("input_id"), "sources": sources, "groups": []}
+        targets = ["recording.mp4" if len(groups) == 1 else f"recording_{i + 1:03d}.mp4" for i in range(len(groups))]
+        reusable = {}
+        if previous and previous.get("phase") == "preparing":
+            planned = {name: group for name, group in zip(targets, groups)}
+            for completed in previous.get("groups", []):
+                name = completed["output"]
+                if (name not in planned or name in reusable or
+                        completed["sources"] != [s["name"] for s in planned[name]]):
+                    raise RuntimeError("Invalid partial verification receipt")
+                output = run_dir / name
+                if output.is_symlink():
+                    raise RuntimeError("Untrusted recording output path")
+                if output.is_file() and digest(output) == completed["sha256"]:
+                    try:
+                        self.validate(output, planned[name])
+                    except RuntimeError:
+                        continue
+                    reusable[name] = completed
+            # Keep every validated group durable even if a different group fails.
+            manifest["groups"] = list(reusable.values())
         persist(receipt, manifest)
         supported = all(s["media"]["fingerprint"][0]["codec_name"] in ("h264", "hevc", "mpeg4")
                         and all(a["codec_name"] == "aac" for a in s["media"]["fingerprint"][1:]) for s in sources)
@@ -182,11 +206,16 @@ class Finalizer:
             manifest["phase"] = "kept_mkv"
             persist(receipt, manifest)
             return [], "kept_mkv"
-        needed = sum(s["size"] for s in sources) * 1.15 + int(self.config.get("minimum_free_bytes", 1))
+        needed = sum(s["size"] for name, group in zip(targets, groups) if name not in reusable
+                     for s in group) * 1.15 + int(self.config.get("minimum_free_bytes", 1))
         if shutil.disk_usage(run_dir).free < needed:
             raise RuntimeError("Insufficient finalization space; sources retained")
         for index, group in enumerate(groups):
-            target = run_dir / ("recording.mp4" if len(groups) == 1 else f"recording_{index + 1:03d}.mp4")
+            target = run_dir / targets[index]
+            if target.name in reusable:
+                continue
+            if target.is_symlink():
+                raise RuntimeError("Untrusted recording output path")
             if target.exists():
                 # A receipt-less old output is evidence, never an authorization to delete.
                 os.replace(target, run_dir / f"unverified_{uuid.uuid4().hex}.mp4")
@@ -209,7 +238,10 @@ class Finalizer:
             os.replace(temporary, target)
             manifest["groups"].append({"output": target.name, "sha256": digest(target),
                                        "sources": [s["name"] for s in group]})
+            manifest["groups"].sort(key=lambda g: targets.index(g["output"]))
             persist(receipt, manifest)
+        if any(digest(run_dir / s["name"]) != s["sha256"] for s in sources):
+            raise RuntimeError("Source changed during finalization")
         manifest["phase"] = "verified"
         persist(receipt, manifest)
         self.cleanup(run_dir, receipt, manifest)

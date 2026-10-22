@@ -119,6 +119,8 @@ systemctl --user enable --now kn20a-recorder.service
 sudo loginctl enable-linger "$USER"
 ```
 
+録画の常駐運用ではWindowsのタスクスケジューラ、Linuxのsystemdユニットを使用してください。Windowsでは録画FFmpegをKill-on-close Job Objectで管理し、Linuxのsystemdユニットでは `KillMode=mixed` を指定しています。LinuxでPythonを直接起動した場合、Pythonが `SIGKILL` などで強制終了してもFFmpegが残る可能性があります。手動で再起動する前に古いFFmpegプロセスと録画ファイルへの書き込みが終了したことを確認してください。
+
 確認は `systemctl --user status kn20a-recorder.service`、ログは `journalctl --user -u kn20a-recorder.service -f`。自動起動だけの無効化は `systemctl --user disable kn20a-recorder.service`、現在の実行も停止するなら `--now` を追加します。lingerは他のサービスにも影響するため自動解除しません。起動時にホームと録画先がマウント済みである必要があります。PC本体の停電復帰は別途UEFI/BIOSで設定してください。
 
 ## 開発と検証

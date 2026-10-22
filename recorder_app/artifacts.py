@@ -63,6 +63,27 @@ def persist(path, value):
             os.close(descriptor)
 
 
+def check_segment_sequence(names):
+    """Validate only the new attempt/segment naming scheme; legacy stays supported."""
+    attempts = {}
+    for name in names:
+        match = re.fullmatch(r"part_(\d{8})_(\d{9})\.mkv", name)
+        if match:
+            attempt, segment = (int(value) for value in match.groups())
+            attempts.setdefault(attempt, []).append(segment)
+    for attempt, segments in attempts.items():
+        indices = sorted(segments)
+        missing = 0 if indices[0] != 0 else next(
+            (left + 1 for left, right in zip(indices, indices[1:]) if right != left + 1),
+            None,
+        )
+        if missing is not None:
+            raise RuntimeError(
+                f"Missing segment part_{attempt:08d}_{missing:09d}.mkv; "
+                "originals must be retained"
+            )
+
+
 class Finalizer:
     def __init__(self, config):
         self.config = config
@@ -144,6 +165,7 @@ class Finalizer:
             raise RuntimeError("Untrusted recording artifact path")
         if previous and previous.get("phase") == "verified":
             names = [s["name"] for s in previous["sources"]]
+            check_segment_sequence(names)
             outputs = [g["output"] for g in previous["groups"]]
             covered = [name for g in previous["groups"] for name in g["sources"]]
             if (not names or not outputs or len(names) != len(set(names)) or sorted(covered) != sorted(names)
@@ -167,6 +189,7 @@ class Finalizer:
             raise RuntimeError("No original MKV/MP4 segments found")
         if any(run_dir.glob("part_*.mkv")) and any(run_dir.glob("part_*.mp4")):
             raise RuntimeError("Mixed legacy and MKV sources require manual reconciliation")
+        check_segment_sequence([path.name for path in files])
         if previous and previous.get("phase") == "preparing":
             recorded = {s["name"]: s["sha256"] for s in previous["sources"]}
             if len(recorded) != len(previous["sources"]) or {p.name: digest(p) for p in files} != recorded:

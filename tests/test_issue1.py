@@ -18,7 +18,7 @@ import urllib.error
 from unittest import mock
 
 import recorder
-from recorder_app.artifacts import Finalizer, digest, persist, frame_shapes
+from recorder_app.artifacts import Finalizer, digest, persist, frame_shapes, check_segment_sequence
 from recorder_app.configuration import normalize, to_v2
 from recorder_app.controls import make_controls
 from recorder_app.inputs import input_adapter
@@ -46,6 +46,33 @@ class Contracts(unittest.TestCase):
         self.assertEqual(migrated["preset_failure_policy"], "legacy")
         self.assertEqual(migrated["input_url"], old["input_url"])
         self.assertNotIn("controls", old)
+
+    def test_new_segment_numbers_are_checked_per_attempt(self):
+        check_segment_sequence(["part_01.mkv", "part_10.mkv",
+            "part_00000001_000000000.mkv", "part_00000001_000000001.mkv",
+            "part_00000003_000000000.mkv"])
+        for names in (
+            ["part_00000001_000000001.mkv"],
+            ["part_00000001_000000000.mkv", "part_00000001_000000002.mkv"],
+            ["part_00000001_000000000.mkv", "part_00000002_000000000.mkv",
+             "part_00000002_000000002.mkv"],
+        ):
+            with self.subTest(names=names):
+                with self.assertRaisesRegex(RuntimeError, "Missing segment"):
+                    check_segment_sequence(names)
+
+    def test_stream_url_status_representation_never_contains_path_secrets(self):
+        cases = [
+            ("rtsp://user:basic-secret@camera.example:554/live/path-secret?sig=query-secret#fragment-secret",
+             "rtsp://camera.example:554"),
+            ("rtmps://user:basic-secret@camera.example/live/token-secret",
+             "rtmps://camera.example"),
+            ("rtsp://[2001:db8::1]:8554/live/path-secret?sig=query-secret",
+             "rtsp://[2001:db8::1]:8554"),
+        ]
+        for original, expected in cases:
+            with self.subTest(original=original):
+                self.assertEqual(recorder.public_url(original), expected)
 
     def test_frame_metadata_field_order_is_not_assumed(self):
         data = io.BytesIO(json.dumps({"frames":[{"width":64,"height":96,"pix_fmt":"yuv420p","side_data_list":[{"side_data_type":"unregistered"}]},
@@ -512,6 +539,34 @@ coordinator.manual(lambda: os._exit(73))
         self.assertEqual(self.store.get(item["id"])["status"], "cancelled")
         self.assertIsNone(manager.process)
 
+    @unittest.skipUnless(sys.platform == "win32", "Requires Windows")
+    def test_recording_job_assignment_failure_kills_ffmpeg(self):
+        item = self.reservation()
+        self.store.update(item["id"], start=(self.now - timedelta(seconds=1)).isoformat())
+        executable = self.root / "ffmpeg.exe"
+        executable.write_bytes(b"fake")
+        manager = recorder.RecorderManager({
+            **recorder.DEFAULT_CONFIG, "ffmpeg_path": str(executable),
+            "output_dir_resolved": str(self.root), "minimum_free_bytes": 1,
+        }, self.store)
+        process = mock.Mock()
+        process.wait.return_value = -9
+        job = mock.Mock()
+        job.assign.side_effect = OSError("assignment failure")
+        with (mock.patch.object(manager, "_estimate_bitrate_mbps", return_value=(3.5, "mock")),
+              mock.patch.object(recorder, "LOG_DIR", self.root),
+              mock.patch.object(recorder.shutil, "disk_usage", return_value=mock.Mock(free=10 ** 12)),
+              mock.patch.object(recorder, "WindowsKillOnCloseJob", return_value=job),
+              mock.patch.object(recorder.subprocess, "Popen", return_value=process)):
+            manager._start_process(self.store.get(item["id"]))
+        job.assign.assert_called_once_with(process)
+        process.kill.assert_called_once()
+        process.wait.assert_called_once()
+        self.assertIsNone(manager.process)
+        self.assertEqual(manager.active_id, "")
+        self.assertIn("assignment failure", self.store.get(item["id"])["last_error"])
+        job.close()
+
     def test_cancel_during_spawn_stops_process_without_reverting_status(self):
         item = self.reservation()
         self.store.update(item["id"], start=(self.now - timedelta(seconds=1)).isoformat())
@@ -549,7 +604,8 @@ coordinator.manual(lambda: os._exit(73))
         with (mock.patch.object(manager, "_estimate_bitrate_mbps", return_value=(3.5, "mock")),
               mock.patch.object(recorder, "LOG_DIR", self.root),
               mock.patch.object(recorder.shutil, "disk_usage", return_value=mock.Mock(free=10 ** 12)),
-              mock.patch.object(recorder.subprocess, "Popen", side_effect=spawn)):
+              mock.patch.object(recorder.subprocess, "Popen", side_effect=spawn),
+              mock.patch.object(recorder, "WindowsKillOnCloseJob", return_value=mock.Mock())):
             starter = threading.Thread(target=start)
             starter.start()
             try:
@@ -579,12 +635,20 @@ class GenericAPI(unittest.TestCase):
             exposure = stack.enter_context(mock.patch.object(recorder,"ExposureClient",side_effect=AssertionError("Generic control")))
             guard = stack.enter_context(mock.patch.object(recorder,"ExposureGuard",side_effect=AssertionError("Generic analysis")))
             state = recorder.AppState({**recorder.DEFAULT_CONFIG, "schema_version":2,
-                "input":{"type":"rtsp","url":"rtsp://127.0.0.1/test"}, "output_dir_resolved":str(root)})
+                "input":{"type":"rtsp","url":"rtsp://user:basic-secret@127.0.0.1:554/live/path-secret?sig=query-secret#fragment-secret"},
+                "listen_url":"rtmp://0.0.0.0:1935/live/listen-secret?sig=listen-query-secret",
+                "output_dir_resolved":str(root)})
             server = recorder.ThreadingHTTPServer(("127.0.0.1",0),recorder.make_handler(state))
             thread = threading.Thread(target=server.serve_forever,daemon=True)
             thread.start()
             try:
                 base = f"http://127.0.0.1:{server.server_port}"
+                # GET /api/state is available without an operation token.
+                with urllib.request.urlopen(base + "/api/state", timeout=3) as response:
+                    public_config = json.load(response)["config"]
+                self.assertEqual(public_config["input_url"], "rtsp://127.0.0.1:554")
+                self.assertEqual(public_config["listen_url"], "rtmp://0.0.0.0:1935")
+                self.assertNotIn("secret", json.dumps(public_config))
                 for endpoint in ("/api/exposure","/api/presets"):
                     with self.assertRaises(urllib.error.HTTPError) as error:
                         urllib.request.urlopen(base+endpoint,timeout=3)
@@ -738,6 +802,26 @@ class RealArtifactSafety(unittest.TestCase):
 
     def test_require_reconnect_without_control_finalizes_existing_media(self):
         self.require_reconnect_scenario(no_camera=True)
+
+    def test_missing_middle_segment_blocks_cleanup_before_manifest(self):
+        segments = [self.segment(f"part_00000001_{i:09d}.mkv") for i in range(3)]
+        segments[1].unlink()
+        with self.assertRaisesRegex(RuntimeError, "Missing segment"):
+            self.finalizer.finalize(self.run)
+        self.assertTrue(segments[0].exists())
+        self.assertTrue(segments[2].exists())
+        self.assertFalse((self.run / "manifest.json").exists())
+        self.assertFalse((self.run / "recording.mp4").exists())
+
+    def test_old_verified_receipt_with_gap_still_blocks_cleanup(self):
+        sources = [self.segment(f"part_00000001_{i:09d}.mkv") for i in (0, 2)]
+        self.config["keep_mkv_after_remux"] = True
+        with mock.patch("recorder_app.artifacts.check_segment_sequence"):
+            self.finalizer.finalize(self.run)  # Receipt generated by older software.
+        self.config["keep_mkv_after_remux"] = False
+        with self.assertRaisesRegex(RuntimeError, "Missing segment"):
+            self.finalizer.finalize(self.run)
+        self.assertTrue(all(path.exists() for path in sources))
 
     def test_untrusted_existing_output_does_not_authorize_cleanup(self):
         source = self.segment()

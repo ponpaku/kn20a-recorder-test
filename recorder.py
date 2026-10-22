@@ -264,7 +264,8 @@ def handle_termination(signum: int, frame: Any) -> None:
 
 def public_url(value):
     parsed = urllib.parse.urlsplit(str(value))
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", ""))
+    # A stream path may itself contain a bearer token.
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], "", "", ""))
 
 
 class PresetStore:
@@ -490,6 +491,7 @@ class RecorderManager:
         self.preparation = PresetCoordinator(camera, store, config, now_jst)
         self.lock = threading.RLock()
         self.process: Optional[subprocess.Popen[bytes]] = None
+        self.recording_job: Optional[WindowsKillOnCloseJob] = None
         self.log_handle: Optional[Any] = None
         self.active_id = ""
         self.run_dir: Optional[Path] = None
@@ -558,6 +560,9 @@ class RecorderManager:
         self._stop_process(graceful=True)
         self.thread.join(timeout=5)
         self.finalizer_thread.join(timeout=5)
+        if self.recording_job is not None:
+            self.recording_job.close()
+            self.recording_job = None
 
     def _complete_capture(self, schedule_id: str, *, partial: bool = False) -> None:
         """Finish captured media with the same MP4 policy on every recovery path."""
@@ -817,6 +822,9 @@ class RecorderManager:
                 self.log_handle = None
                 return
             try:
+                if os.name == "nt" and self.recording_job is None:
+                    # Fail closed instead of starting a recording with no parent-owned job.
+                    self.recording_job = WindowsKillOnCloseJob()
                 process = subprocess.Popen(
                     args,
                     stdin=subprocess.PIPE,
@@ -825,6 +833,17 @@ class RecorderManager:
                     cwd=str(APP_DIR),
                     creationflags=creationflags,
                 )
+                if self.recording_job is not None:
+                    try:
+                        self.recording_job.assign(process)
+                    except Exception:
+                        # Assignment must precede making this process active.
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
+                        process.wait(timeout=5)
+                        raise
             except Exception as exc:
                 self.log_handle.close()
                 self.log_handle = None

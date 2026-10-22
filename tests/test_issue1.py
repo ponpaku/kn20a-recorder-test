@@ -386,6 +386,190 @@ coordinator.manual(lambda: os._exit(73))
         self.assertIsNone(manager.preparation.owner)
 
 
+    def test_reconnect_expiry_retains_sources_when_postprocessing_disabled(self):
+        item = self.reservation()
+        folder = self.root / "recordings" / "reconnect"
+        folder.mkdir(parents=True)
+        sources = [folder / "part_00000001_000000000.mkv",
+                   folder / "part_00000001_000000001.mkv"]
+        for source in sources:
+            source.write_bytes(b"previously captured media")
+        self.store.update(
+            item["id"], status="reconnecting",
+            start=(self.now - timedelta(minutes=2)).isoformat(),
+            end=(self.now - timedelta(seconds=1)).isoformat(),
+            output_dir=str(folder), gaps=[{"reason": "stream_exit"}],
+        )
+        manager = recorder.RecorderManager({
+            **recorder.DEFAULT_CONFIG, "output_dir_resolved": str(folder.parent),
+            "postprocess_mp4": False, "keep_mkv_after_remux": False,
+        }, self.store)
+        manager.preparation.set_owner(item["id"])
+        with mock.patch.object(manager, "_queue_finalization") as queue:
+            manager._tick()
+        queue.assert_not_called()
+        self.assertTrue(manager.finalize_queue.empty())
+        self.assertEqual(self.store.get(item["id"])["status"], "completed")
+        self.assertEqual(self.store.get(item["id"])["outcome"], "partial")
+        self.assertTrue(all(source.exists() for source in sources))
+        self.assertEqual(list(folder.glob("*.mp4")), [])
+        self.assertIsNone(manager.preparation.owner)
+
+    def test_restart_after_end_retains_sources_when_postprocessing_disabled(self):
+        item = self.reservation()
+        folder = self.root / "recordings" / "restart"
+        folder.mkdir(parents=True)
+        sources = [folder / "part_00000001_000000000.mkv",
+                   folder / "part_00000001_000000001.mkv"]
+        for source in sources:
+            source.write_bytes(b"previously captured media")
+        self.store.update(
+            item["id"], status="recording",
+            start=(self.now - timedelta(minutes=2)).isoformat(),
+            end=(self.now - timedelta(seconds=1)).isoformat(),
+            output_dir=str(folder),
+        )
+        manager = recorder.RecorderManager({
+            **recorder.DEFAULT_CONFIG, "output_dir_resolved": str(folder.parent),
+            "postprocess_mp4": False, "keep_mkv_after_remux": False,
+        }, self.store)
+        with (mock.patch.object(recorder, "LOG_DIR", self.root),
+              mock.patch.object(manager.thread, "start"),
+              mock.patch.object(manager.finalizer_thread, "start"),
+              mock.patch.object(manager, "_queue_finalization") as queue):
+            manager.start()
+        queue.assert_not_called()
+        self.assertTrue(manager.finalize_queue.empty())
+        self.assertEqual(self.store.get(item["id"])["status"], "completed")
+        self.assertEqual(self.store.get(item["id"])["outcome"], "partial")
+        self.assertTrue(all(source.exists() for source in sources))
+        self.assertEqual(list(folder.glob("*.mp4")), [])
+
+    def test_packet_frame_and_decode_scans_use_configured_validation_timeout(self):
+        finalizer = Finalizer({"ffmpeg_path": "ffmpeg", "validation_timeout_seconds": 601})
+        calls = []
+        metadata = {"streams": [{
+            "codec_type": "video", "codec_name": "h264",
+            "nb_read_packets": "1", "width": 64, "height": 64,
+            "pix_fmt": "yuv420p",
+        }], "format": {"duration": "1.0"}}
+
+        def run(command, **kwargs):
+            calls.append(kwargs["timeout"])
+            if kwargs["timeout"] <= 300:
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+            if "-count_packets" in command:
+                return mock.Mock(returncode=0, stderr=b"", stdout=json.dumps(metadata).encode())
+            if "-show_frames" in command:
+                kwargs["stdout"].write(b'{"frames":[{"width":64,"height":64,"pix_fmt":"yuv420p"}]}')
+                return mock.Mock(returncode=0, stderr=b"")
+            return mock.Mock(returncode=0, stderr=b"")
+
+        with mock.patch("recorder_app.artifacts.subprocess.run", side_effect=run):
+            info = finalizer.inspect(self.root / "part_01.mkv")
+            finalizer.validate(self.root / "recording.mp4", [{"media": info}])
+        self.assertEqual(calls, [601.0] * 5)
+
+    def test_cancel_during_bitrate_estimate_prevents_late_ffmpeg_start(self):
+        item = self.reservation()
+        self.store.update(item["id"], start=(self.now - timedelta(seconds=1)).isoformat())
+        executable = self.root / "ffmpeg"
+        executable.write_bytes(b"fake executable")
+        manager = recorder.RecorderManager({
+            **recorder.DEFAULT_CONFIG, "ffmpeg_path": str(executable),
+            "output_dir_resolved": str(self.root), "minimum_free_bytes": 1,
+        }, self.store)
+        estimating, resume = threading.Event(), threading.Event()
+
+        def estimate(_root):
+            estimating.set()
+            if not resume.wait(5):
+                raise TimeoutError("test estimate gate did not resume")
+            return 3.5, "mock"
+
+        errors = []
+        def start():
+            try:
+                manager._start_process(self.store.get(item["id"]))
+            except Exception as exc:
+                errors.append(exc)
+
+        with (mock.patch.object(manager, "_estimate_bitrate_mbps", side_effect=estimate),
+              mock.patch.object(recorder, "LOG_DIR", self.root),
+              mock.patch.object(recorder.shutil, "disk_usage", return_value=mock.Mock(free=10 ** 12)),
+              mock.patch.object(recorder.subprocess, "Popen") as popen):
+            worker = threading.Thread(target=start)
+            worker.start()
+            try:
+                self.assertTrue(estimating.wait(3))
+                self.assertTrue(manager.cancel(item["id"]))
+            finally:
+                resume.set()
+                worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+            popen.assert_not_called()
+        self.assertEqual(self.store.get(item["id"])["status"], "cancelled")
+        self.assertIsNone(manager.process)
+
+    def test_cancel_during_spawn_stops_process_without_reverting_status(self):
+        item = self.reservation()
+        self.store.update(item["id"], start=(self.now - timedelta(seconds=1)).isoformat())
+        executable = self.root / "ffmpeg"
+        executable.write_bytes(b"fake executable")
+        manager = recorder.RecorderManager({
+            **recorder.DEFAULT_CONFIG, "ffmpeg_path": str(executable),
+            "output_dir_resolved": str(self.root), "minimum_free_bytes": 1,
+        }, self.store)
+        spawning, release = threading.Event(), threading.Event()
+        process = mock.Mock()
+        process.returncode = None
+        process.poll.side_effect = lambda: process.returncode
+        def stop(timeout=None):
+            process.returncode = 0
+            return 0
+        process.wait.side_effect = stop
+        process.stdin = io.BytesIO()
+        process.stdout = io.BytesIO()
+        process.stderr = io.BytesIO()
+
+        def spawn(*args, **kwargs):
+            spawning.set()
+            if not release.wait(5):
+                raise TimeoutError("test spawn gate did not resume")
+            return process
+
+        errors = []
+        def start():
+            try:
+                manager._start_process(self.store.get(item["id"]))
+            except Exception as exc:
+                errors.append(exc)
+
+        with (mock.patch.object(manager, "_estimate_bitrate_mbps", return_value=(3.5, "mock")),
+              mock.patch.object(recorder, "LOG_DIR", self.root),
+              mock.patch.object(recorder.shutil, "disk_usage", return_value=mock.Mock(free=10 ** 12)),
+              mock.patch.object(recorder.subprocess, "Popen", side_effect=spawn)):
+            starter = threading.Thread(target=start)
+            starter.start()
+            try:
+                self.assertTrue(spawning.wait(3))
+                cancel_result = []
+                canceller = threading.Thread(target=lambda: cancel_result.append(manager.cancel(item["id"])))
+                canceller.start()
+            finally:
+                release.set()
+            starter.join(5)
+            canceller.join(5)
+            self.assertFalse(starter.is_alive())
+            self.assertFalse(canceller.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(cancel_result, [True])
+        self.assertEqual(self.store.get(item["id"])["status"], "cancelled")
+        self.assertIsNone(manager.process)
+        self.assertEqual(manager.active_id, "")
+
+
 class GenericAPI(unittest.TestCase):
     def test_generic_api_refuses_control_and_creates_no_analysis(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:

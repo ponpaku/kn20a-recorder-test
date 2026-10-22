@@ -535,7 +535,7 @@ class RecorderManager:
                         if folder and (list(folder.glob("part_*.mkv")) or list(folder.glob("part_*.mp4")) or (folder / "manifest.json").exists()):
                             self.store.update(item["id"], previous_capture_state=previous,
                                               gaps=item.get("gaps", []) + [{"reason": "process_restart", "at": now_jst().isoformat()}])
-                            self._queue_finalization(item["id"])
+                            self._complete_capture(item["id"], partial=True)
                         else:
                             self.store.update(item["id"], status="missed", outcome="no_media")
                     except (OSError, ValueError):
@@ -558,6 +558,23 @@ class RecorderManager:
         self._stop_process(graceful=True)
         self.thread.join(timeout=5)
         self.finalizer_thread.join(timeout=5)
+
+    def _complete_capture(self, schedule_id: str, *, partial: bool = False) -> None:
+        """Finish captured media with the same MP4 policy on every recovery path."""
+        with self.store.lock:
+            item = self.store.get(schedule_id)
+            if item is None or item.get("status") == "cancelled":
+                return
+            finished_at = now_jst().isoformat()
+            if bool(self.config.get("postprocess_mp4", True)):
+                self.store.update(schedule_id, recording_completed_at=finished_at)
+                self._queue_finalization(schedule_id)
+            else:
+                self.store.update(
+                    schedule_id, status="completed", completed_at=finished_at,
+                    outcome="partial" if partial or item.get("gaps") else "unknown",
+                    last_error="",
+                )
 
     def _queue_finalization(self, schedule_id: str) -> None:
         with self.lock:
@@ -674,7 +691,7 @@ class RecorderManager:
                     if item.get("status") in {"starting", "recording", "reconnecting", "stopping"} and parse_datetime(item["end"]) <= current:
                         folder = Path(item["output_dir"]) if item.get("output_dir") else None
                         if folder and (list(folder.glob("part_*.mkv")) or list(folder.glob("part_*.mp4"))):
-                            self._queue_finalization(item["id"])
+                            self._complete_capture(item["id"], partial=item.get("status") == "reconnecting")
                         else:
                             self.store.update(item["id"], status="failed", outcome="no_media", last_error="有効な映像を受信できませんでした")
             return
@@ -692,6 +709,8 @@ class RecorderManager:
                 self.preparation.set_owner(active["id"])
                 self._start_process(active)
             current_item = self.store.get(active["id"])
+            if current_item and current_item.get("status") == "cancelled" and self.process is None:
+                self.preparation.set_owner(None)
             if current_item and current_item.get("status") == "failed":
                 self.preparation.set_owner(None)
                 folder = Path(current_item["output_dir"]) if current_item.get("output_dir") else None
@@ -699,13 +718,19 @@ class RecorderManager:
                     # Failure to resume must not strand already captured media.
                     self.store.update(active["id"], capture_stop_reason=current_item.get("last_error", ""),
                                       control_warning="録画再開を中止: " + current_item.get("last_error", ""))
-                    if bool(self.config.get("postprocess_mp4", True)):
-                        self._queue_finalization(active["id"])
-                    else:
-                        self.store.update(active["id"], status="completed", outcome="partial",
-                                          completed_at=now_jst().isoformat())
+                    self._complete_capture(active["id"], partial=True)
         elif self.process is not None:
             self._update_recording_state(active["id"])
+
+    def _may_start(self, item: dict[str, Any]) -> bool:
+        """Check the reservation again while holding the ScheduleStore lock."""
+        current = self.store.get(item["id"])
+        return bool(
+            current
+            and current.get("status") in {"pending", "starting", "recording", "reconnecting"}
+            and current.get("revision", 0) == item.get("revision", 0)
+            and parse_datetime(current["end"]) > now_jst()
+        )
 
     def _start_process(self, item: dict[str, Any]) -> None:
         if self.input_check is not None:
@@ -713,7 +738,9 @@ class RecorderManager:
         ffmpeg_path = Path(self.config["ffmpeg_path"])
         if not ffmpeg_path.is_file():
             self.last_error = f"ffmpegが見つかりません: {ffmpeg_path}"
-            self.store.update(item["id"], status="failed", last_error=self.last_error)
+            with self.store.lock:
+                if self._may_start(item):
+                    self.store.update(item["id"], status="failed", last_error=self.last_error)
             return
 
         remaining_seconds = max(0, (parse_datetime(item["end"]) - now_jst()).total_seconds())
@@ -731,14 +758,16 @@ class RecorderManager:
                 f"{round((safety_factor - 1) * 100):d}% + 予備 "
                 f"{reserve / 1_000_000_000:.1f}GB"
             )
-            self.store.update(
-                item["id"],
-                status="failed",
-                last_error=self.last_error,
-                estimated_bitrate_mbps=round(estimated_bitrate, 3),
-                estimated_size_bytes=estimated_media_bytes,
-                estimate_source=estimate_source,
-            )
+            with self.store.lock:
+                if self._may_start(item):
+                    self.store.update(
+                        item["id"],
+                        status="failed",
+                        last_error=self.last_error,
+                        estimated_bitrate_mbps=round(estimated_bitrate, 3),
+                        estimated_size_bytes=estimated_media_bytes,
+                        estimate_source=estimate_source,
+                    )
             return
 
         self.attempt = int(item.get("attempts", 0)) + 1
@@ -780,44 +809,51 @@ class RecorderManager:
 
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self.log_handle = log_path.open("ab", buffering=0)
-        try:
-            process = subprocess.Popen(
-                args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=str(APP_DIR),
-                creationflags=creationflags,
-            )
-        except Exception as exc:
-            self.log_handle.close()
-            self.log_handle = None
-            self.last_error = str(exc)
-            self.next_retry_at = time.monotonic() + int(self.config["retry_seconds"])
-            self.store.update(item["id"], status="starting", last_error=self.last_error)
-            return
+        # Cancellation and launching must be linearized. Capacity estimation
+        # deliberately happens before this lock so cancel() stays responsive.
+        with self.store.lock:
+            if not self._may_start(item):
+                self.log_handle.close()
+                self.log_handle = None
+                return
+            try:
+                process = subprocess.Popen(
+                    args,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=str(APP_DIR),
+                    creationflags=creationflags,
+                )
+            except Exception as exc:
+                self.log_handle.close()
+                self.log_handle = None
+                self.last_error = str(exc)
+                self.next_retry_at = time.monotonic() + int(self.config["retry_seconds"])
+                self.store.update(item["id"], status="starting", last_error=self.last_error)
+                return
 
-        with self.lock:
-            self.process = process
-            self.active_id = item["id"]
-            self.run_dir = run_dir
-            self.started_at = now_jst().isoformat()
-            self.last_error = ""
-            self.last_progress_at = time.monotonic()
-            self.progress_started = False
-        threading.Thread(target=self._read_progress, args=(process,), daemon=True).start()
-        threading.Thread(target=self._read_recording_log, args=(process,), daemon=True).start()
-        self.store.update(
-            item["id"],
-            status="starting",
-            attempts=self.attempt,
-            last_error="",
-            output_dir=str(run_dir),
-            started_at=self.started_at,
-            estimated_bitrate_mbps=round(estimated_bitrate, 3),
-            estimated_size_bytes=estimated_media_bytes,
-            estimate_source=estimate_source,
-        )
+            with self.lock:
+                self.process = process
+                self.active_id = item["id"]
+                self.run_dir = run_dir
+                self.started_at = now_jst().isoformat()
+                self.last_error = ""
+                self.last_progress_at = time.monotonic()
+                self.progress_started = False
+            threading.Thread(target=self._read_progress, args=(process,), daemon=True).start()
+            threading.Thread(target=self._read_recording_log, args=(process,), daemon=True).start()
+            self.store.update(
+                item["id"],
+                status="starting",
+                attempts=self.attempt,
+                last_error="",
+                output_dir=str(run_dir),
+                started_at=self.started_at,
+                estimated_bitrate_mbps=round(estimated_bitrate, 3),
+                estimated_size_bytes=estimated_media_bytes,
+                estimate_source=estimate_source,
+            )
 
     def _read_progress(self, process):
         previous = -1
@@ -943,18 +979,7 @@ class RecorderManager:
             if item and item.get("status") != "cancelled":
                 if parse_datetime(item["end"]) <= now_jst():
                     if self._run_size() > 0:
-                        if bool(self.config.get("postprocess_mp4", True)):
-                            self.store.update(
-                                schedule_id,
-                                recording_completed_at=now_jst().isoformat(),
-                            )
-                            self._queue_finalization(schedule_id)
-                        else:
-                            self.store.update(
-                                schedule_id,
-                                status="completed",
-                                completed_at=now_jst().isoformat(),
-                            )
+                        self._complete_capture(schedule_id)
                     else:
                         self.last_error = "映像を一度も受信できませんでした"
                         self.store.update(schedule_id, status="failed", last_error=self.last_error)

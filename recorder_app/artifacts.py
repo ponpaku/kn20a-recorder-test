@@ -74,7 +74,7 @@ class Finalizer:
     def inspect(self, path):
         result = subprocess.run([self.ffprobe, "-v", "error", "-count_packets", "-show_streams",
             "-show_format", "-show_data_hash", "sha256", "-of", "json", str(path)],
-            capture_output=True, timeout=300)
+            capture_output=True, timeout=float(self.config.get("validation_timeout_seconds", 21600)))
         if result.returncode or result.stderr.strip():
             raise RuntimeError(f"Media inspection failed: {path.name}")
         data = json.loads(result.stdout)

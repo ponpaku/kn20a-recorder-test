@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 APP_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(APP_DIR))
 SPEC = importlib.util.spec_from_file_location("kn20a_recorder_sim", APP_DIR / "recorder.py")
 recorder = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None

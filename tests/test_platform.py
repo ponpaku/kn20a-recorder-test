@@ -75,6 +75,7 @@ class PlatformTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             shutil.copy(recorder.__file__, root / "recorder.py")
+            shutil.copytree(recorder.APP_DIR / "recorder_app", root / "recorder_app")
             shutil.copytree(recorder.WEB_DIR, root / "web")
             with socket.socket() as reservation:
                 reservation.bind(("127.0.0.1", 0))

@@ -36,6 +36,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
+from recorder_app.configuration import normalize
+from recorder_app.inputs import input_adapter, InputInspector
+from recorder_app.controls import make_controls, DisabledGuard, UnsupportedCapability, PresetControl
+from recorder_app.preparation import PresetCoordinator, ControlConflict
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -205,12 +209,9 @@ def parse_datetime(value: str) -> datetime:
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
+    from recorder_app.artifacts import persist
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    os.replace(temp_path, path)
+    persist(path, value)
 
 
 def safe_title(value: str) -> str:
@@ -227,7 +228,10 @@ def load_config() -> dict[str, Any]:
             raise ValueError("config.json must contain an object")
         config.update(loaded)
     else:
+        config.update(schema_version=2, input={"type": "rtsp", "url": config["input_url"]},
+                      controls={"presets": {"driver": "none"}, "exposure": {"driver": "none"}})
         atomic_write_json(CONFIG_PATH, config)
+    config = normalize(config)
     config["ffmpeg_path"] = resolve_executable(str(config["ffmpeg_path"]))
     output_dir = Path(config["output_dir"])
     if not output_dir.is_absolute():
@@ -256,6 +260,11 @@ def ffprobe_path(config: dict[str, Any]) -> Path:
 def handle_termination(signum: int, frame: Any) -> None:
     """Let normal shutdown close recordings and reap analyzer children."""
     raise KeyboardInterrupt
+
+
+def public_url(value):
+    parsed = urllib.parse.urlsplit(str(value))
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc.rsplit("@", 1)[-1], parsed.path, "", ""))
 
 
 class PresetStore:
@@ -329,7 +338,10 @@ class PresetStore:
 
 
 class ScheduleStore:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, default_policy="legacy", default_deadline=10, default_resource=None):
+        self.default_policy = default_policy
+        self.default_deadline = default_deadline
+        self.default_resource = default_resource
         self.path = path
         self.lock = threading.RLock()
         self.items: list[dict[str, Any]] = []
@@ -365,9 +377,12 @@ class ScheduleStore:
                     item["preset_number"] = int(item["preset_number"])
                     if not 0 <= item["preset_number"] <= 254:
                         raise ValueError("schedules.json contains an invalid preset number")
-                if item.get("status") in {"recording", "starting"}:
-                    item["status"] = "pending"
+                if "preset_failure_policy" not in item:
+                    item["preset_failure_policy"] = "legacy"
+                    item["preset_deadline_seconds"] = 10
                     changed = True
+                if item["preset_failure_policy"] not in {"legacy", "continue", "require"}:
+                    raise ValueError("Invalid reservation preset policy")
             if changed:
                 self.save()
 
@@ -389,7 +404,13 @@ class ScheduleStore:
         start_value: str,
         end_value: str,
         preset_number: Optional[int] = None,
+        preset_failure_policy: Optional[str] = None,
+        preset_deadline_seconds: Optional[float] = None,
     ) -> dict[str, Any]:
+        policy = preset_failure_policy or self.default_policy
+        deadline = self.default_deadline if preset_deadline_seconds is None else float(preset_deadline_seconds)
+        if policy not in {"legacy", "continue", "require"} or not 0 < deadline <= 60:
+            raise ValueError("プリセット方針または期限が不正です")
         start = parse_datetime(start_value)
         end = parse_datetime(end_value)
         current = now_jst()
@@ -419,6 +440,11 @@ class ScheduleStore:
                 "end": end.isoformat(),
                 "status": "pending",
                 "preset_number": preset_number,
+                "preset_failure_policy": policy,
+                "preset_deadline_seconds": deadline,
+                "contract_version": 2,
+                "revision": 0,
+                "preset_resource": dict(self.default_resource) if self.default_resource is not None else None,
                 "created_at": current.isoformat(),
                 "attempts": 0,
                 "last_error": "",
@@ -440,7 +466,7 @@ class ScheduleStore:
     def cancel(self, schedule_id: str) -> Optional[dict[str, Any]]:
         with self.lock:
             item = self.get(schedule_id)
-            if item is None or item.get("status") not in {"pending", "starting", "recording"}:
+            if item is None or item.get("status") not in {"pending", "starting", "recording", "reconnecting"}:
                 return None
             return self.update(schedule_id, status="cancelled", cancelled_at=now_jst().isoformat())
 
@@ -458,10 +484,10 @@ class RecorderSnapshot:
 
 
 class RecorderManager:
-    def __init__(self, config: dict[str, Any], store: ScheduleStore, camera: ExposureClient):
+    def __init__(self, config: dict[str, Any], store: ScheduleStore, camera: Optional[PresetControl] = None):
         self.config = config
         self.store = store
-        self.camera = camera
+        self.preparation = PresetCoordinator(camera, store, config, now_jst)
         self.lock = threading.RLock()
         self.process: Optional[subprocess.Popen[bytes]] = None
         self.log_handle: Optional[Any] = None
@@ -471,6 +497,9 @@ class RecorderManager:
         self.started_at = ""
         self.last_error = ""
         self.next_retry_at = 0.0
+        self.last_progress_at = time.monotonic()
+        self.progress_started = False
+        self.input_check = None
         self.next_preset_retry_at: dict[str, float] = {}
         self.prepared_presets: dict[str, int] = {}
         self.stop_event = threading.Event()
@@ -486,6 +515,35 @@ class RecorderManager:
         Path(self.config["output_dir_resolved"]).mkdir(parents=True, exist_ok=True)
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         for item in self.store.list():
+            if item.get("status") in {"recording", "starting", "reconnecting", "stopping", "pending"}:
+                previous = item["status"]
+                if parse_datetime(item["end"]) <= now_jst():
+                    try:
+                        folder = Path(item["output_dir"]) if item.get("output_dir") else None
+                        root = Path(self.config["output_dir_resolved"]).resolve()
+                        if folder is None:
+                            matches = list(root.glob(f"*_{item['id']}"))
+                            if len(matches) > 1:
+                                raise ValueError("予約に対応する録画フォルダが複数あります")
+                            folder = matches[0] if matches else None
+                            if folder:
+                                self.store.update(item["id"], output_dir=str(folder))
+                        if folder and folder.exists():
+                            list(folder.iterdir())  # Do not hide an access error as 'no media'.
+                        if folder is not None and root not in folder.resolve().parents:
+                            raise ValueError("録画フォルダが保存先の外です")
+                        if folder and (list(folder.glob("part_*.mkv")) or list(folder.glob("part_*.mp4")) or (folder / "manifest.json").exists()):
+                            self.store.update(item["id"], previous_capture_state=previous,
+                                              gaps=item.get("gaps", []) + [{"reason": "process_restart", "at": now_jst().isoformat()}])
+                            self._queue_finalization(item["id"])
+                        else:
+                            self.store.update(item["id"], status="missed", outcome="no_media")
+                    except (OSError, ValueError):
+                        self.store.update(item["id"], status="recovery_required", last_error="録画ファイルの復旧照合が必要です")
+                    continue
+                if previous != "pending":
+                    self.store.update(item["id"], status="pending", previous_capture_state=previous,
+                                      gaps=item.get("gaps", []) + [{"reason": "process_restart", "at": now_jst().isoformat()}])
             if item.get("status") in {"finalizing", "postprocess_failed"}:
                 self._queue_finalization(item["id"])
         self.finalizer_thread.start()
@@ -493,6 +551,9 @@ class RecorderManager:
 
     def shutdown(self) -> None:
         self.stop_event.set()
+        if self.input_check is not None:
+            self.input_check.cancel()
+        self.preparation.shutdown()
         self._stop_process(graceful=True)
         self.thread.join(timeout=5)
         self.finalizer_thread.join(timeout=5)
@@ -529,134 +590,26 @@ class RecorderManager:
                 self.finalize_queue.task_done()
 
     def _valid_mp4(self, path: Path) -> bool:
-        if not path.is_file() or path.stat().st_size <= 0:
-            return False
-        ffprobe = ffprobe_path(self.config)
-        if not ffprobe.is_file():
-            return False
-        result = subprocess.run(
-            [
-                str(ffprobe),
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(path),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            timeout=60,
-            check=False,
-        )
+        from recorder_app.artifacts import Finalizer
         try:
-            return result.returncode == 0 and float(result.stdout.strip()) > 0
-        except (TypeError, ValueError):
+            finalizer = Finalizer(self.config)
+            info = finalizer.inspect(path)
+            finalizer.validate(path, [{"media": info}])
+            return True
+        except Exception:
             return False
 
     def _remux_schedule(self, schedule_id: str) -> None:
+        from recorder_app.artifacts import Finalizer
         item = self.store.get(schedule_id)
-        if item is None:
-            raise RuntimeError("予約が見つかりません")
-        output_dir = str(item.get("output_dir", "")).strip()
-        if not output_dir:
+        if not item or not item.get("output_dir"):
             raise RuntimeError("録画フォルダが記録されていません")
-        output_root = Path(self.config["output_dir_resolved"]).resolve()
-        run_dir = Path(output_dir).resolve()
-        if output_root not in run_dir.parents:
-            raise RuntimeError("録画フォルダが保存先の外側です")
-        if not run_dir.is_dir():
-            raise RuntimeError("録画フォルダが見つかりません")
-        mkv_sources = sorted(run_dir.glob("*.mkv"))
-        legacy_parts = sorted(run_dir.glob("part_*.mp4"))
-        target = run_dir / "recording.mp4"
-        inputs = mkv_sources if mkv_sources else legacy_parts
-        if self._valid_mp4(target):
-            if not bool(self.config.get("keep_mkv_after_remux", False)):
-                for source in mkv_sources:
-                    source.unlink(missing_ok=True)
-            for source in legacy_parts:
-                source.unlink(missing_ok=True)
-            self.store.update(
-                schedule_id,
-                status="completed",
-                completed_at=now_jst().isoformat(),
-                mp4_files=[str(target)],
-                last_error="",
-            )
-            return
-        if not inputs:
-            raise RuntimeError("結合対象のMKV/MP4がありません")
-
-        temporary = run_dir / "recording.mp4.partial"
-        concat_list = run_dir / "recording.ffconcat"
-        temporary.unlink(missing_ok=True)
-        concat_list.unlink(missing_ok=True)
-        ffmpeg_path = Path(self.config["ffmpeg_path"])
-        log_path = LOG_DIR / f"remux_{schedule_id}.log"
-        with log_path.open("ab", buffering=0) as log_handle:
-            input_args: list[str]
-            if len(inputs) == 1:
-                input_args = ["-i", str(inputs[0])]
-            else:
-                concat_lines = ["ffconcat version 1.0"] + [
-                    f"file '{source.name.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'"
-                    for source in inputs
-                ]
-                concat_list.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
-                input_args = ["-f", "concat", "-safe", "0", "-i", str(concat_list)]
-            args = [
-                str(ffmpeg_path),
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "info",
-                "-y",
-                *input_args,
-                "-map",
-                "0:v:0",
-                "-map",
-                "0:a?",
-                "-c",
-                "copy",
-                "-movflags",
-                "+faststart",
-                "-f",
-                "mp4",
-                str(temporary),
-            ]
-            try:
-                result = subprocess.run(
-                    args,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=log_handle,
-                    cwd=str(APP_DIR),
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    check=False,
-                )
-            finally:
-                concat_list.unlink(missing_ok=True)
-            if result.returncode != 0 or not self._valid_mp4(temporary):
-                temporary.unlink(missing_ok=True)
-                raise RuntimeError("分割録画を1本のMP4へ結合できませんでした")
-            os.replace(temporary, target)
-
-        if not bool(self.config.get("keep_mkv_after_remux", False)):
-            for source in mkv_sources:
-                source.unlink(missing_ok=True)
-        for source in legacy_parts:
-            source.unlink(missing_ok=True)
-
-        self.store.update(
-            schedule_id,
-            status="completed",
-            completed_at=now_jst().isoformat(),
-            mp4_files=[str(target)],
-            last_error="",
-        )
+        outputs, state = Finalizer(self.config).finalize(item["output_dir"])
+        self.store.update(schedule_id, status="completed", completed_at=now_jst().isoformat(),
+                          mp4_files=outputs, finalization=state,
+                          outcome="partial" if item.get("gaps") else "unknown",
+                          last_error="", control_warning=item.get("control_warning", ""),
+                          media_warning="元ファイルを保持しました（MP4非対応構成）" if state == "kept_mkv" else "")
 
     def _active_schedule(self, current: datetime) -> Optional[dict[str, Any]]:
         for item in self.store.list():
@@ -666,7 +619,7 @@ class RecorderManager:
             if status == "pending" and current >= end:
                 self.store.update(item["id"], status="missed", last_error="終了時刻までサービスが起動していませんでした")
                 continue
-            if status in {"pending", "starting", "recording"} and start <= current < end:
+            if status in {"pending", "starting", "recording", "reconnecting"} and start <= current < end:
                 return item
         return None
 
@@ -689,35 +642,7 @@ class RecorderManager:
         return None
 
     def _prepare_preset(self, item: dict[str, Any]) -> bool:
-        preset = item.get("preset_number")
-        if preset is None:
-            return True
-        preset = int(preset)
-        if self.prepared_presets.get(item["id"]) == preset:
-            return True
-        if time.monotonic() < self.next_preset_retry_at.get(item["id"], 0.0):
-            return False
-        try:
-            self.camera.recall_preset(preset)
-            settle_seconds = float(self.config.get("preset_settle_seconds", 2))
-            if self.stop_event.wait(max(0.0, settle_seconds)):
-                return False
-        except Exception as exc:
-            self.last_error = f"プリセット{preset}の呼出待ち: {exc}"
-            self.next_preset_retry_at[item["id"]] = time.monotonic() + int(self.config["retry_seconds"])
-            self.store.update(item["id"], last_error=self.last_error)
-            logging.warning("preset recall failed schedule=%s preset=%s: %s", item["id"], preset, exc)
-            return False
-        self.prepared_presets[item["id"]] = preset
-        self.next_preset_retry_at.pop(item["id"], None)
-        self.last_error = ""
-        self.store.update(
-            item["id"],
-            last_error="",
-            preset_recalled_at=now_jst().isoformat(),
-        )
-        logging.info("preset recalled schedule=%s preset=%s", item["id"], preset)
-        return True
+        return self.preparation.ready(item)
 
     def _tick(self) -> None:
         current = now_jst()
@@ -735,10 +660,22 @@ class RecorderManager:
             if exit_code is not None:
                 self._finish_process(exit_code)
                 process = None
+            elif time.monotonic() - self.last_progress_at > float(self.config.get("stall_timeout_seconds", 15) if self.progress_started else self.config.get("connection_timeout_seconds", 45)):
+                self._stop_process(graceful=False)
+                process = None
 
         if active is None:
             if process is not None:
                 self._stop_process(graceful=True)
+            else:
+                self.preparation.set_owner(None)
+                for item in self.store.list():
+                    if item.get("status") in {"starting", "recording", "reconnecting", "stopping"} and parse_datetime(item["end"]) <= current:
+                        folder = Path(item["output_dir"]) if item.get("output_dir") else None
+                        if folder and (list(folder.glob("part_*.mkv")) or list(folder.glob("part_*.mp4"))):
+                            self._queue_finalization(item["id"])
+                        else:
+                            self.store.update(item["id"], status="failed", outcome="no_media", last_error="有効な映像を受信できませんでした")
             return
 
         if process is not None and active_id != active["id"]:
@@ -746,11 +683,16 @@ class RecorderManager:
 
         if self.process is None and time.monotonic() >= self.next_retry_at:
             if self._prepare_preset(active):
+                self.preparation.set_owner(active["id"])
                 self._start_process(active)
+                if self.store.get(active["id"]).get("status") == "failed":
+                    self.preparation.set_owner(None)
         elif self.process is not None:
             self._update_recording_state(active["id"])
 
     def _start_process(self, item: dict[str, Any]) -> None:
+        if self.input_check is not None:
+            self.input_check.cancel()
         ffmpeg_path = Path(self.config["ffmpeg_path"])
         if not ffmpeg_path.is_file():
             self.last_error = f"ffmpegが見つかりません: {ffmpeg_path}"
@@ -763,7 +705,7 @@ class RecorderManager:
         estimated_bitrate, estimate_source = self._estimate_bitrate_mbps(output_root)
         estimated_media_bytes = int(remaining_seconds * estimated_bitrate * 1_000_000 / 8)
         safety_factor = float(self.config.get("storage_safety_factor", 1.15))
-        estimated_bytes = int(estimated_media_bytes * safety_factor)
+        estimated_bytes = int(estimated_media_bytes * safety_factor * 2)
         reserve = int(self.config["minimum_free_bytes"])
         if free_bytes < estimated_bytes + reserve:
             self.last_error = (
@@ -787,7 +729,9 @@ class RecorderManager:
         folder_name = f"{parse_datetime(item['start']).strftime('%Y%m%d_%H%M')}_{safe_title(item['title'])}_{item['id']}"
         run_dir = Path(self.config["output_dir_resolved"]) / folder_name
         run_dir.mkdir(parents=True, exist_ok=True)
-        output_pattern = run_dir / f"part_{self.attempt:02d}_%Y%m%d_%H%M%S.mkv"
+        existing_attempts = [int(p.name.split("_")[1]) for p in run_dir.glob("part_*.mkv") if p.name.split("_")[1].isdigit()]
+        self.attempt = max([self.attempt] + [value + 1 for value in existing_attempts])
+        output_pattern = run_dir / f"part_{self.attempt:08d}_%09d.mkv"
         log_path = LOG_DIR / f"ffmpeg_{item['id']}_{self.attempt:02d}_{start_stamp}.log"
 
         args = [
@@ -795,31 +739,11 @@ class RecorderManager:
             "-hide_banner",
             "-loglevel",
             "info",
+            "-progress",
+            "pipe:1",
+            "-nostats",
         ]
-        if self.config.get("input_mode") == "rtsp":
-            args.extend(
-                [
-                    "-rtsp_transport",
-                    "tcp",
-                    "-timeout",
-                    str(int(self.config["rtsp_timeout_microseconds"])),
-                    "-i",
-                    str(self.config["input_url"]),
-                ]
-            )
-        elif self.config.get("input_mode") == "rtmp-listen":
-            args.extend(
-                [
-                    "-rtmp_listen",
-                    "1",
-                    "-timeout",
-                    str(int(self.config["publisher_wait_seconds"])),
-                    "-i",
-                    str(self.config["listen_url"]),
-                ]
-            )
-        else:
-            raise ValueError("input_mode must be 'rtsp' or 'rtmp-listen'")
+        args.extend(input_adapter(self.config).arguments())
         args.extend([
             "-map",
             "0:v:0",
@@ -833,8 +757,6 @@ class RecorderManager:
             str(int(self.config["segment_seconds"])),
             "-reset_timestamps",
             "1",
-            "-strftime",
-            "1",
             "-y",
             str(output_pattern),
         ])
@@ -845,8 +767,8 @@ class RecorderManager:
             process = subprocess.Popen(
                 args,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=self.log_handle,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 cwd=str(APP_DIR),
                 creationflags=creationflags,
             )
@@ -864,6 +786,10 @@ class RecorderManager:
             self.run_dir = run_dir
             self.started_at = now_jst().isoformat()
             self.last_error = ""
+            self.last_progress_at = time.monotonic()
+            self.progress_started = False
+        threading.Thread(target=self._read_progress, args=(process,), daemon=True).start()
+        threading.Thread(target=self._read_recording_log, args=(process,), daemon=True).start()
         self.store.update(
             item["id"],
             status="starting",
@@ -875,6 +801,34 @@ class RecorderManager:
             estimated_size_bytes=estimated_media_bytes,
             estimate_source=estimate_source,
         )
+
+    def _read_progress(self, process):
+        previous = -1
+        if process.stdout is None:
+            return
+        for line in iter(process.stdout.readline, b""):
+            if line.startswith(b"out_time_us="):
+                try:
+                    value = int(line.strip().split(b"=", 1)[1])
+                except ValueError:
+                    continue
+                if value > previous:
+                    with self.lock:
+                        if self.process is process:
+                            self.last_progress_at = time.monotonic()
+                            self.progress_started = value > 0
+                    previous = value
+
+    def _read_recording_log(self, process):
+        if process.stderr is None:
+            return
+        for line in iter(process.stderr.readline, b""):
+            text = line.decode("utf-8", errors="replace")
+            text = re.sub(r"((?:rtsps?|rtmps?|https?|wss?)://)[^\s/@]+@", r"\1***@", text)
+            text = re.sub(r"([?&](?:password|token|key|passphrase)=)[^\s&]+", r"\1***", text, flags=re.I)
+            with self.lock:
+                if self.log_handle is not None and self.process is process:
+                    self.log_handle.write(text.encode("utf-8"))
 
     def _probe_duration_seconds(self, path: Path) -> Optional[float]:
         ffprobe = ffprobe_path(self.config)
@@ -919,6 +873,13 @@ class RecorderManager:
             return fallback, "設定値"
         measured: list[float] = []
         for path in candidates[:20]:
+            if self.config.get("schema_version") == 2:
+                try:
+                    manifest = json.loads((path.parent / "manifest.json").read_text(encoding="utf-8"))
+                    if manifest.get("input_id") != self.config.get("input_id"):
+                        continue
+                except (OSError, ValueError):
+                    continue
             duration = self._probe_duration_seconds(path)
             if duration is None:
                 continue
@@ -957,6 +918,7 @@ class RecorderManager:
                 self.log_handle.close()
                 self.log_handle = None
         if schedule_id:
+            self.preparation.invalidate(schedule_id)
             self.prepared_presets.pop(schedule_id, None)
             self.next_preset_retry_at.pop(schedule_id, None)
             item = self.store.get(schedule_id)
@@ -980,10 +942,13 @@ class RecorderManager:
                         self.store.update(schedule_id, status="failed", last_error=self.last_error)
                 else:
                     self.last_error = f"ffmpegが終了しました (code={exit_code})。再接続します"
-                    self.store.update(schedule_id, status="starting", last_error=self.last_error)
+                    self.store.update(schedule_id, status="reconnecting", last_error=self.last_error,
+                                      gaps=item.get("gaps", []) + [{"reason": "stream_exit", "at": now_jst().isoformat(), "code": exit_code}])
                     base_retry = int(self.config["retry_seconds"])
                     retry_delay = min(60, base_retry * (2 ** min(max(self.attempt - 1, 0), 4)))
                     self.next_retry_at = time.monotonic() + retry_delay
+            if not item or parse_datetime(item["end"]) <= now_jst() or item.get("status") == "cancelled":
+                self.preparation.set_owner(None)
 
     def _stop_process(self, graceful: bool) -> None:
         with self.lock:
@@ -1010,6 +975,7 @@ class RecorderManager:
         item = self.store.cancel(schedule_id)
         if item is None:
             return False
+        self.preparation.invalidate(schedule_id)
         with self.lock:
             is_active = self.active_id == schedule_id
         if is_active:
@@ -1066,194 +1032,7 @@ class RecorderManager:
         ).__dict__
 
 
-class ExposureClient:
-    def __init__(self, camera_ip: str, visca_port: int):
-        self.camera_ip = camera_ip
-        self.visca_port = int(visca_port)
-        self.lock = threading.RLock()
-        # The Codex/runtime environment may define an outbound HTTP proxy.  A
-        # private LAN camera must be contacted directly.
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-    def _http_parameters(self) -> dict[str, Any]:
-        command = json.dumps(
-            {"GetEnv": {"VideoParam": {"nChannel": -1}}}, separators=(",", ":")
-        )
-        url = f"http://{self.camera_ip}/ajaxcom?" + urllib.parse.urlencode({"szCmd": command})
-        request = urllib.request.Request(url, headers={"User-Agent": "KN20A-Recorder/1.0"})
-        with self.opener.open(request, timeout=4) as response:
-            value = json.loads(response.read().decode("utf-8-sig"))
-        if value.get("nRetVal") != 0 or not value.get("stValue"):
-            raise RuntimeError(f"カメラ応答エラー: {value.get('nRetVal')}")
-        return value["stValue"][0]
-
-    @staticmethod
-    def _named_value(container: dict[str, Any], list_key: str, value_key: str) -> dict[str, Any]:
-        current = int(container[value_key])
-        options = [
-            {"value": int(entry["nValue"]), "label": str(entry["szName"])}
-            for entry in container[list_key]
-        ]
-        label = next((entry["label"] for entry in options if entry["value"] == current), str(current))
-        return {"value": current, "label": label, "options": options}
-
-    def get(self) -> dict[str, Any]:
-        with self.lock:
-            params = self._http_parameters()
-            exp = params["stExp"]
-            mode_value = int(exp["stExpMode"]["emExpMode"])
-            modes = [
-                {"value": int(value), "label": MODE_LABELS.get(int(value), str(value))}
-                for value in exp["stExpMode"]["byExpModeList"]
-            ]
-            return {
-                "camera_ip": self.camera_ip,
-                "mode": {
-                    "value": mode_value,
-                    "label": MODE_LABELS.get(mode_value, str(mode_value)),
-                    "options": modes,
-                },
-                "iris": {
-                    **self._named_value(exp["stIris"], "stIrisList", "nIris"),
-                    "actual": mode_value in {3, 11},
-                },
-                "shutter": self._named_value(exp["stShutter"], "stShutterList", "nShutter"),
-                "gain_limit": int(exp.get("gainLimit", 0)),
-                "gain": int(exp.get("again", 0)),
-                "drc": int(exp.get("drc", 0)),
-                "antiflicker": int(exp.get("antiflicker", 0)),
-            }
-
-    def _visca(self, command: bytes, completion_timeout: float = 2.0) -> list[bytes]:
-        frames: list[bytes] = []
-        with socket.create_connection((self.camera_ip, self.visca_port), timeout=3) as sock:
-            sock.settimeout(1.5)
-            sock.sendall(command)
-            buffer = bytearray()
-            deadline = time.monotonic() + max(0.5, float(completion_timeout))
-            while time.monotonic() < deadline:
-                try:
-                    chunk = sock.recv(64)
-                except socket.timeout:
-                    continue
-                if not chunk:
-                    break
-                buffer.extend(chunk)
-                while 0xFF in buffer:
-                    index = buffer.index(0xFF)
-                    frames.append(bytes(buffer[: index + 1]))
-                    del buffer[: index + 1]
-                    if len(frames[-1]) > 1:
-                        response_type = frames[-1][1] & 0xF0
-                        if response_type == 0x60:
-                            raise RuntimeError("カメラがVISCAコマンドを拒否しました")
-                        if response_type == 0x50:
-                            return frames
-        if not frames:
-            raise RuntimeError("VISCA応答がありません")
-        raise RuntimeError("VISCA完了応答がありません")
-
-    @staticmethod
-    def _validate_preset(number: int) -> int:
-        number = int(number)
-        if not 0 <= number <= 254:
-            raise ValueError("プリセット番号は0〜254で指定してください")
-        return number
-
-    def save_preset(self, number: int) -> None:
-        number = self._validate_preset(number)
-        with self.lock:
-            self._visca(bytes([0x81, 0x01, 0x04, 0x3F, 0x01, number, 0xFF]), completion_timeout=5)
-
-    def recall_preset(self, number: int) -> None:
-        number = self._validate_preset(number)
-        with self.lock:
-            self._visca(bytes([0x81, 0x01, 0x04, 0x3F, 0x02, number, 0xFF]), completion_timeout=15)
-
-    def _set_shutter_direct(self, shutter: int) -> None:
-        self._visca(
-            bytes([0x81, 0x01, 0x04, 0x4A, 0x00, 0x00, (shutter >> 4) & 0x0F, shutter & 0x0F, 0xFF])
-        )
-
-    def _set_gain_direct(self, gain: int) -> None:
-        self._visca(bytes([0x81, 0x01, 0x04, 0x4C, 0x00, 0x00, 0x00, gain, 0xFF]))
-
-    def set(
-        self,
-        mode: int,
-        iris: Optional[int],
-        shutter: Optional[int],
-        gain_limit: Optional[int],
-        gain: Optional[int] = None,
-    ) -> dict[str, Any]:
-        if mode not in MODE_LABELS:
-            raise ValueError("未対応の露出モードです")
-        if iris is not None and not 0 <= iris <= 12:
-            raise ValueError("絞り値が範囲外です")
-        if shutter is not None and not 0 <= shutter <= 33:
-            raise ValueError("シャッター値が範囲外です")
-        if gain_limit is not None and not 0 <= gain_limit <= 15:
-            raise ValueError("ゲイン上限が範囲外です")
-        if gain is not None and not 0 <= gain <= 15:
-            raise ValueError("ゲイン値が範囲外です")
-
-        with self.lock:
-            before = self.get()
-            valid_shutters = {int(item["value"]) for item in before["shutter"]["options"]}
-            if shutter is not None and shutter not in valid_shutters:
-                raise ValueError("カメラが対応していないシャッター値です")
-            apply_fixed_iris = iris is not None and mode in {3, 11}
-            apply_fixed_shutter = shutter is not None and mode in {3, 10}
-            apply_fixed_gain = gain is not None and mode == 3
-            self._visca(bytes([0x81, 0x01, 0x04, 0x39, mode, 0xFF]))
-            if apply_fixed_iris:
-                self._visca(bytes([0x81, 0x01, 0x04, 0x4B, 0x00, 0x00, 0x00, iris, 0xFF]))
-            if apply_fixed_shutter:
-                self._set_shutter_direct(shutter)
-            if apply_fixed_gain:
-                self._set_gain_direct(gain)
-            if gain_limit is not None:
-                self._visca(bytes([0x81, 0x01, 0x04, 0x2C, gain_limit, 0xFF]))
-            time.sleep(0.25)
-            after = self.get()
-        if int(after["mode"]["value"]) != mode:
-            raise RuntimeError("露出モードの変更を確認できませんでした")
-        if apply_fixed_iris and int(after["iris"]["value"]) != iris:
-            raise RuntimeError("絞り値の変更を確認できませんでした")
-        if apply_fixed_shutter and int(after["shutter"]["value"]) != shutter:
-            raise RuntimeError("シャッター値の変更を確認できませんでした")
-        if gain_limit is not None and int(after["gain_limit"]) != gain_limit:
-            raise RuntimeError("ゲイン上限の変更を確認できませんでした")
-        if apply_fixed_gain and int(after["gain"]) != gain:
-            raise RuntimeError("ゲイン値の変更を確認できませんでした")
-
-        history = APP_DIR / "data" / "exposure_history.jsonl"
-        history.parent.mkdir(parents=True, exist_ok=True)
-        with history.open("a", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(
-                    {"at": now_jst().isoformat(), "before": before, "after": after},
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-        return after
-
-    def set_sae_shutter(self, shutter: int) -> dict[str, Any]:
-        """Change only the SAE shutter and verify it from the camera."""
-        with self.lock:
-            before = self.get()
-            if int(before["mode"]["value"]) != 10:
-                raise RuntimeError("回折ガードにはSAE（シャッター優先）が必要です")
-            valid = {int(item["value"]) for item in before["shutter"]["options"]}
-            if shutter not in valid:
-                raise ValueError("カメラが対応していないシャッター値です")
-            self._set_shutter_direct(shutter)
-            time.sleep(0.25)
-            after = self.get()
-            if int(after["shutter"]["value"]) != shutter:
-                raise RuntimeError("シャッター値の変更を確認できませんでした")
-            return after
+from recorder_app.kn20a import ExposureClient
 
 
 def _histogram_percentile(histogram: list[int], sample_count: int, percentile: float) -> int:
@@ -2568,12 +2347,14 @@ class ExposureGuard:
 
 class AppState:
     def __init__(self, config: dict[str, Any]):
+        config = normalize(config)
         self.config = config
-        self.store = ScheduleStore(SCHEDULE_PATH)
+        self.store = ScheduleStore(SCHEDULE_PATH, config["preset_failure_policy"], config["preset_deadline_seconds"], config["controls"].get("presets", {"driver":"none"}))
         self.presets = PresetStore(PRESET_PATH)
-        self.exposure = ExposureClient(config["camera_ip"], config["visca_port"])
-        self.recorder = RecorderManager(config, self.store, self.exposure)
-        self.exposure_guard = ExposureGuard(self.exposure, EXPOSURE_GUARD_PATH, config)
+        self.preset_control, self.exposure, self.capabilities = make_controls(config, ExposureClient)
+        self.recorder = RecorderManager(config, self.store, self.preset_control)
+        self.recorder.input_check = InputInspector(config, ffprobe_path(config), self.recorder)
+        self.exposure_guard = ExposureGuard(self.exposure, EXPOSURE_GUARD_PATH, config) if self.exposure is not None else DisabledGuard()
         self.token = secrets.token_urlsafe(32)
 
     def status(self) -> dict[str, Any]:
@@ -2591,6 +2372,9 @@ class AppState:
             None,
         )
         return {
+            "capabilities": self.capabilities,
+            "input_check": self.recorder.input_check.result,
+            "control": {"uncertain": self.recorder.preparation.uncertain},
             "now": current.isoformat(),
             "recorder": self.recorder.snapshot(),
             "schedules": schedules,
@@ -2601,8 +2385,8 @@ class AppState:
             "config": {
                 "camera_ip": self.config["camera_ip"],
                 "input_mode": self.config["input_mode"],
-                "input_url": self.config["input_url"],
-                "listen_url": self.config["listen_url"],
+                "input_url": public_url(self.config["input_url"]),
+                "listen_url": public_url(self.config["listen_url"]),
                 "output_dir": self.config["output_dir_resolved"],
                 "segment_seconds": self.config["segment_seconds"],
             },
@@ -2674,10 +2458,14 @@ def make_handler(state: AppState):
                 if path == "/api/state":
                     self._json({"ok": True, **state.status()})
                 elif path == "/api/exposure":
+                    if state.exposure is None:
+                        raise UnsupportedCapability("exposure.read")
                     self._json({"ok": True, "exposure": state.exposure.get()})
                 elif path == "/api/exposure-guard":
                     self._json({"ok": True, "guard": state.exposure_guard.snapshot()})
                 elif path == "/api/presets":
+                    if state.preset_control is None:
+                        raise UnsupportedCapability("presets.list")
                     self._json({"ok": True, "presets": state.presets.list()})
                 elif path in {"/", "/index.html"}:
                     self._static("index.html")
@@ -2687,6 +2475,8 @@ def make_handler(state: AppState):
                     self._static("style.css")
                 else:
                     self.send_error(404)
+            except UnsupportedCapability as exc:
+                self._json({"ok": False, "error": str(exc), "code": "unsupported_capability", "capability": exc.capability}, 422)
             except Exception as exc:
                 logging.exception("GET failed")
                 self._error(str(exc), 500)
@@ -2697,14 +2487,43 @@ def make_handler(state: AppState):
             path = urllib.parse.urlparse(self.path).path
             try:
                 body = self._body()
+                if path == "/api/input-check":
+                    try:
+                        result = state.recorder.input_check.start()
+                    except RuntimeError as exc:
+                        raise ControlConflict(str(exc))
+                    self._json({"ok": True, "input_check": result}, 202)
+                    return
+                if path.startswith("/api/exposure") and state.exposure is None:
+                    raise UnsupportedCapability("exposure.write")
+                if path.startswith("/api/presets") and state.preset_control is None:
+                    raise UnsupportedCapability("presets")
+                if path == "/api/control/acknowledge":
+                    if body.get("confirmed") is not True:
+                        raise ValueError("カメラの停止・画角確認が必要です")
+                    state.recorder.preparation.acknowledge()
+                    self._json({"ok": True})
+                    return
+                finalize_match = re.fullmatch(r"/api/schedules/([0-9a-f]{12})/finalize", path)
+                if finalize_match:
+                    item = state.store.get(finalize_match.group(1))
+                    if not item or item.get("status") not in {"postprocess_failed", "recovery_required"}:
+                        raise ControlConflict("再処理できる予約ではありません")
+                    state.recorder._queue_finalization(item["id"])
+                    self._json({"ok": True}, 202)
+                    return
                 if path == "/api/schedules":
                     raw_preset = body.get("preset_number")
                     preset_number = None if raw_preset in {None, ""} else int(raw_preset)
+                    if preset_number is not None and state.preset_control is None:
+                        raise UnsupportedCapability("presets.recall")
                     item = state.store.create(
                         body.get("title", ""),
                         body.get("start", ""),
                         body.get("end", ""),
                         preset_number,
+                        body.get("preset_failure_policy"),
+                        body.get("preset_deadline_seconds"),
                     )
                     self._json({"ok": True, "schedule": item}, 201)
                     return
@@ -2716,8 +2535,11 @@ def make_handler(state: AppState):
                     end = start + timedelta(seconds=duration)
                     raw_preset = body.get("preset_number")
                     preset_number = None if raw_preset in {None, ""} else int(raw_preset)
+                    if preset_number is not None and state.preset_control is None:
+                        raise UnsupportedCapability("presets.recall")
                     item = state.store.create(
-                        "受信テスト", start.isoformat(), end.isoformat(), preset_number
+                        "受信テスト", start.isoformat(), end.isoformat(), preset_number,
+                        body.get("preset_failure_policy"), body.get("preset_deadline_seconds")
                     )
                     self._json({"ok": True, "schedule": item}, 201)
                     return
@@ -2730,7 +2552,7 @@ def make_handler(state: AppState):
                     return
                 if path == "/api/presets":
                     number = int(body["number"])
-                    state.exposure.save_preset(number)
+                    state.recorder.preparation.manual(lambda: state.preset_control.save_preset(number))
                     preset = state.presets.upsert(number, body.get("name", ""))
                     self._json({"ok": True, "preset": preset}, 201)
                     return
@@ -2739,7 +2561,7 @@ def make_handler(state: AppState):
                     number = int(recall_match.group(1))
                     if state.presets.get(number) is None:
                         raise ValueError("プリセットが登録されていません")
-                    state.exposure.recall_preset(number)
+                    state.recorder.preparation.manual(lambda: state.preset_control.recall_preset(number))
                     self._json({"ok": True})
                     return
                 remove_match = re.fullmatch(r"/api/presets/(\d{1,3})/remove", path)
@@ -2775,6 +2597,10 @@ def make_handler(state: AppState):
                     self._json({"ok": True, "guard": guard})
                     return
                 self.send_error(404)
+            except UnsupportedCapability as exc:
+                self._json({"ok": False, "error": str(exc), "code": "unsupported_capability", "capability": exc.capability}, 422)
+            except ControlConflict as exc:
+                self._error(str(exc), 409)
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
                 self._error(str(exc), 400)
             except Exception as exc:
@@ -2836,6 +2662,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="KN20A scheduled recorder")
     parser.add_argument("--no-browser", action="store_true", help="do not open the dashboard")
     parser.add_argument("--check", action="store_true", help="validate files and exit")
+    parser.add_argument("--migrate-config", choices=("preview", "apply"), help="preview/apply non-destructive v2 migration")
     args = parser.parse_args()
 
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -2848,6 +2675,22 @@ def main() -> int:
         ],
     )
     config = load_config()
+    if args.migrate_config:
+        from recorder_app.configuration import to_v2
+        migrated = to_v2(config)
+        if args.migrate_config == "apply":
+            try:
+                with socket.create_connection((str(config["web_host"]), int(config["web_port"])), timeout=0.5):
+                    raise RuntimeError("Stop the recorder before applying migration")
+            except OSError:
+                pass
+            stamp = now_jst().strftime("%Y%m%d%H%M%S%f")
+            for path in (CONFIG_PATH, SCHEDULE_PATH, PRESET_PATH, EXPOSURE_GUARD_PATH):
+                if path.exists():
+                    shutil.copy2(path, path.with_name(path.name + ".pre-v2-" + stamp))
+            atomic_write_json(CONFIG_PATH, migrated)
+        print(json.dumps(migrated, ensure_ascii=False, indent=2))
+        return 0
     errors = validate_install(config)
     if args.check:
         if errors:

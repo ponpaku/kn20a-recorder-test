@@ -16,3 +16,6 @@ test-output/
 !.env.example
 Thumbs.db
 .DS_Store
+*.pre-v2-*
+auto.key
+auto.crt

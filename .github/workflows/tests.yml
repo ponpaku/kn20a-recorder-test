@@ -3,6 +3,7 @@ on: [push, pull_request]
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04, windows-latest]
         python: ['3.10', '3.12']
@@ -17,3 +18,20 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - run: python -m unittest discover -s tests -v
       - run: python tests/simulate_exposure_guard.py
+  network:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: |
+          mkdir -p test-output/fixture
+          cd test-output/fixture
+          curl -fsSLO https://github.com/bluenviron/mediamtx/releases/download/v1.21.2/mediamtx_v1.21.2_linux_amd64.tar.gz
+          curl -fsSLO https://github.com/bluenviron/mediamtx/releases/download/v1.21.2/checksums.sha256
+          sha256sum --check --ignore-missing checksums.sha256
+          tar -xzf mediamtx_v1.21.2_linux_amd64.tar.gz mediamtx
+      - run: python tools/investigate_issue1.py --mediamtx ./test-output/fixture/mediamtx --assert-network

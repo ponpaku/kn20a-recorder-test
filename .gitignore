@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 config.json
 schedules.json
+schedules.control.json
 presets.json
 data/
 logs/
@@ -16,3 +17,6 @@ test-output/
 !.env.example
 Thumbs.db
 .DS_Store
+*.pre-v2-*
+auto.key
+auto.crt

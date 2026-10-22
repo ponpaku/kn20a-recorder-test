@@ -126,3 +126,4 @@ footer { display: flex; justify-content: space-between; gap: 16px; padding: 20px
   .guard-last { grid-column: auto; }
   .guard-flow i { display: none; }
 }
+[hidden] { display: none !important; }

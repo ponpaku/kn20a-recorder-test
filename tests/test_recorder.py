@@ -3,6 +3,7 @@ import io
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from datetime import timedelta
@@ -99,8 +100,9 @@ class RecorderTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            def recall_preset(self, number):
-                self.calls.append(number)
+            def recall_preset(self, number, authorize):
+                with authorize():
+                    self.calls.append(number)
 
         with tempfile.TemporaryDirectory() as directory:
             store = recorder.ScheduleStore(Path(directory) / "schedules.json")
@@ -112,14 +114,19 @@ class RecorderTests(unittest.TestCase):
                 store,
                 camera,
             )
-            self.assertTrue(manager._prepare_preset(item))
+            for _ in range(100):
+                if manager._prepare_preset(item): break
+                time.sleep(0.01)
             self.assertTrue(manager._prepare_preset(item))
             self.assertEqual(camera.calls, [7])
             manager.active_id = item["id"]
             manager._finish_process(1)
             self.assertNotIn(item["id"], manager.prepared_presets)
             manager.next_preset_retry_at.pop(item["id"], None)
-            self.assertTrue(manager._prepare_preset(item))
+            for _ in range(100):
+                if manager._prepare_preset(store.get(item["id"])): break
+                time.sleep(0.01)
+            self.assertTrue(manager._prepare_preset(store.get(item["id"])))
             self.assertEqual(camera.calls, [7, 7])
 
     def test_completed_schedule_cannot_be_cancelled(self):
@@ -131,7 +138,9 @@ class RecorderTests(unittest.TestCase):
             self.assertIsNone(store.cancel(item["id"]))
             self.assertEqual(store.get(item["id"])["status"], "completed")
 
-    def test_remux_schedule_replaces_verified_mkv_with_mp4(self):
+    @mock.patch("recorder_app.artifacts.Finalizer.inspect", return_value={"fingerprint":[{"codec_name":"mpeg4"}], "packets":[1], "duration":1})
+    @mock.patch("recorder_app.artifacts.Finalizer.validate")
+    def test_remux_schedule_replaces_verified_mkv_with_mp4(self, *_mocks):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "recordings"
             run_dir = root / "recording"
@@ -154,7 +163,7 @@ class RecorderTests(unittest.TestCase):
 
             def fake_run(args, **kwargs):
                 Path(args[-1]).write_bytes(b"mp4")
-                return mock.Mock(returncode=0)
+                return mock.Mock(returncode=0, stderr=b"")
 
             with mock.patch.object(recorder.subprocess, "run", side_effect=fake_run), mock.patch.object(
                 manager, "_valid_mp4", side_effect=lambda path: path.is_file() and path.stat().st_size > 0
@@ -165,9 +174,11 @@ class RecorderTests(unittest.TestCase):
             self.assertEqual(result["status"], "completed")
             self.assertFalse(source.exists())
             self.assertTrue(run_dir.joinpath("recording.mp4").exists())
-            self.assertEqual(result["mp4_files"], [str(run_dir / "recording.mp4")])
+            self.assertEqual([Path(p).resolve() for p in result["mp4_files"]], [(run_dir / "recording.mp4").resolve()])
 
-    def test_remux_schedule_combines_legacy_mp4_parts(self):
+    @mock.patch("recorder_app.artifacts.Finalizer.inspect", return_value={"fingerprint":[{"codec_name":"mpeg4"}], "packets":[1], "duration":1})
+    @mock.patch("recorder_app.artifacts.Finalizer.validate")
+    def test_remux_schedule_combines_legacy_mp4_parts(self, *_mocks):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "recordings"
             run_dir = root / "recording"
@@ -192,7 +203,7 @@ class RecorderTests(unittest.TestCase):
             def fake_run(args, **kwargs):
                 self.assertIn("concat", args)
                 Path(args[-1]).write_bytes(b"combined")
-                return mock.Mock(returncode=0)
+                return mock.Mock(returncode=0, stderr=b"")
 
             with mock.patch.object(recorder.subprocess, "run", side_effect=fake_run), mock.patch.object(
                 manager, "_valid_mp4", side_effect=lambda path: path.is_file() and path.stat().st_size > 3
@@ -200,9 +211,10 @@ class RecorderTests(unittest.TestCase):
                 manager._remux_schedule(item["id"])
             self.assertTrue(run_dir.joinpath("recording.mp4").exists())
             self.assertTrue(all(not part.exists() for part in parts))
-            self.assertEqual(store.get(item["id"])["mp4_files"], [str(run_dir / "recording.mp4")])
+            self.assertEqual([Path(p).resolve() for p in store.get(item["id"])["mp4_files"]], [(run_dir / "recording.mp4").resolve()])
 
-    def test_remux_failure_keeps_original_mkv(self):
+    @mock.patch("recorder_app.artifacts.Finalizer.inspect", return_value={"fingerprint":[{"codec_name":"mpeg4"}], "packets":[1], "duration":1})
+    def test_remux_failure_keeps_original_mkv(self, *_mocks):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "recordings"
             run_dir = root / "recording"

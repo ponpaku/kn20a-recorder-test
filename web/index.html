@@ -27,6 +27,9 @@
     </section>
 
     <div id="notice" class="notice" hidden></div>
+    <p id="capability-note" class="hint"></p>
+    <p class="hint"><button id="input-check" type="button" class="secondary">入力を確認</button> <span id="input-check-state">未検査</span></p>
+    <button id="acknowledge-control" type="button" class="secondary" hidden>カメラの停止・画角を確認して制御保留を解除</button>
 
     <section class="card schedule-card">
       <div class="section-heading">
@@ -36,6 +39,7 @@
       <form id="schedule-form">
         <label>名称<input id="title" name="title" maxlength="80" placeholder="例：夕景から夜景" required></label>
         <label>画角プリセット<select id="schedule-preset"><option value="">指定なし</option></select></label>
+        <label>画角未確認時<select id="preset-policy"><option value="">設定の既定値</option><option value="continue">録画を優先</option><option value="require">画角を必須にする（10秒）</option></select></label>
         <label>開始日時<input id="start" name="start" type="datetime-local" step="1" required></label>
         <label>終了日時<input id="end" name="end" type="datetime-local" step="1" required></label>
         <button type="submit" class="primary">予約を追加</button>

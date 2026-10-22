@@ -3,6 +3,7 @@ const $ = (selector) => document.querySelector(selector);
 let stateTimer = null;
 let guardFormDirty = false;
 let guardFormSubmitting = false;
+let cameraCapabilities = null;
 
 function formatBytes(value) {
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -48,14 +49,26 @@ function notify(message, kind = "ok") {
 }
 
 function statusLabel(status) {
+  if (status === "reconnecting") return "再接続中";
+  if (status === "recovery_required") return "復旧確認が必要";
   return ({pending:"待機", starting:"接続中", recording:"録画中", stopping:"停止処理中", finalizing:"MP4変換中", postprocess_failed:"変換失敗", completed:"完了", missed:"未実行", cancelled:"取消", failed:"失敗"})[status] || status;
 }
 
 function renderState(data) {
+  cameraCapabilities = data.capabilities;
+  const supportsPresets = cameraCapabilities?.presets?.recall !== false;
+  const supportsExposure = cameraCapabilities?.exposure?.read !== false;
+  $(".preset-card").hidden = !supportsPresets;
+  $(".exposure-card").hidden = !supportsExposure;
+  $("#schedule-preset").disabled = !supportsPresets;
+  $("#preset-policy").disabled = !supportsPresets;
+  $("#capability-note").textContent = !supportsExposure && !supportsPresets ? "Generic：録画のみ。画角・露出・夕景AEは非対応です。" : "";
+  $("#acknowledge-control").hidden = !data.control?.uncertain;
+  $("#input-check-state").textContent = ({not_checked:"未検査",checking:"検査中",ok:"映像入力を確認",unavailable:"入力を確認できません",deferred:"録画受信後に検査",disabled:"検査OFF",cancelled:"録画を優先して検査を中断"})[data.input_check?.state] || "未検査";
   const recorder = data.recorder;
   const stateMap = {
     idle: ["待機中", "idle", "予約時刻になると受信を開始します"],
-    waiting_for_camera: ["カメラ待ち", "waiting", "RTMP接続を待っています"],
+    waiting_for_camera: ["カメラ待ち", "waiting", "映像入力を待っています"],
     recording: ["録画中", "recording", `${formatBytes(recorder.bytes_written)} 保存済み`],
     finalizing: ["MP4変換中", "waiting", "映像はコピーのままMP4へ仕上げています"]
   };
@@ -70,7 +83,7 @@ function renderState(data) {
   $("#metric-disk").textContent = formatBytes(data.disk.free);
   $("#metric-output").textContent = data.config.output_dir;
   $("#clock").textContent = `現在 ${formatDate(data.now)} JST`;
-  if (data.exposure_guard) renderGuard(data.exposure_guard);
+  if (data.exposure_guard && supportsExposure) renderGuard(data.exposure_guard);
   renderPresets(data.presets || []);
 
   const rows = $("#schedule-rows");
@@ -82,7 +95,7 @@ function renderState(data) {
   rows.replaceChildren(...data.schedules.slice().reverse().map(item => {
     const row = document.createElement("tr");
     const activeRecording = item.id === recorder.schedule_id && ["starting", "recording"].includes(item.status);
-    const cancellable = ["pending", "starting", "recording"].includes(item.status);
+    const cancellable = ["pending", "starting", "recording", "reconnecting"].includes(item.status);
     row.innerHTML = `
       <td><span class="status status-${item.status}">${statusLabel(item.status)}</span></td>
       <td><strong></strong><small></small></td>
@@ -91,7 +104,12 @@ function renderState(data) {
       <td class="output-cell"></td>
       <td>${cancellable ? `<button type="button" class="${activeRecording ? "stop-row" : "cancel"} ghost">${activeRecording ? "録画停止" : "取消"}</button>` : ''}</td>`;
     row.querySelector("td strong").textContent = item.title;
-    row.querySelector("td small").textContent = item.last_error || "";
+    row.querySelector("td small").textContent = [item.last_error, item.control_warning, item.media_warning, item.gaps?.length ? "受信欠落あり" : "", item.finalization === "verified" ? "MP4検証済み" : ""].filter(Boolean).join(" / ");
+    if (["postprocess_failed", "recovery_required"].includes(item.status)) {
+      const retry = document.createElement("button"); retry.textContent = "後処理を再試行";
+      retry.addEventListener("click", async () => { try { await api(`/api/schedules/${item.id}/finalize`, {method:"POST", body:"{}"}); await refreshState(); } catch(error) { notify(error.message, "error"); } });
+      row.lastElementChild.append(retry);
+    }
     row.querySelector(".preset-cell").textContent = item.preset_number == null ? "指定なし" : `#${item.preset_number} ${presetNames.get(item.preset_number) || ""}`;
     row.querySelector(".output-cell").textContent = item.output_dir || "—";
     row.querySelector(".cancel")?.addEventListener("click", () => cancelSchedule(item));
@@ -143,6 +161,7 @@ $("#schedule-form").addEventListener("submit", async (event) => {
   try {
     await api("/api/schedules", {method:"POST", body:JSON.stringify({
       title: $("#title").value, preset_number: $("#schedule-preset").value,
+      preset_failure_policy: $("#preset-policy").value || undefined,
       start: $("#start").value, end: $("#end").value
     })});
     notify("録画予約を追加しました");
@@ -169,6 +188,10 @@ $("#refresh").addEventListener("click", () => refreshState(true));
 function renderPresets(presets) {
   const select = $("#schedule-preset");
   const selected = select.value;
+  if (cameraCapabilities?.presets?.recall === false) {
+    select.replaceChildren(new Option("指定なし（制御非対応）", ""));
+    return;
+  }
   const names = new Map(presets.map(item => [Number(item.number), item.name]));
   const commonPresets = Array.from({length: 11}, (_, number) =>
     new Option(`#${number}${names.has(number) ? ` ${names.get(number)}` : ""}`, number));
@@ -377,5 +400,13 @@ $("#calibrate-guard").addEventListener("click", async () => {
 
 setDefaultTimes();
 refreshState(true);
-api("/api/exposure-guard").then(result => renderGuard(result.guard)).catch(error => notify(`夕景AE: ${error.message}`, "error"));
+$("#acknowledge-control").addEventListener("click", async () => {
+  if (!window.confirm("カメラの移動が停止し、画角を確認できましたか？未確認のまま解除しないでください。")) return;
+  try { await api("/api/control/acknowledge", {method:"POST", body:JSON.stringify({confirmed:true})}); await refreshState(); }
+  catch(error) { notify(error.message, "error"); }
+});
+$("#input-check").addEventListener("click", async () => {
+  try { await api("/api/input-check", {method:"POST", body:"{}"}); await refreshState(); }
+  catch(error) { notify(error.message, "error"); }
+});
 stateTimer = window.setInterval(() => refreshState(false), 2000);
